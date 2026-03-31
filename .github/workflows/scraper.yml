@@ -1,0 +1,29 @@
+name: Scraper Falabella
+
+on:
+  schedule:
+    - cron: '0 11 * * *'  # 8 AM Chile time (UTC-3)
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt playwright
+
+      - name: Install Playwright browsers
+        run: playwright install chromium --with-deps
+
+      - name: Run scraper
+        env:
+          FALABELLA_USER: ${{ secrets.FALABELLA_USER }}
+          FALABELLA_PASSWORD: ${{ secrets.FALABELLA_PASSWORD }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python main.py --mode scraper --headless
