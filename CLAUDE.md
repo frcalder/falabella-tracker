@@ -127,7 +127,7 @@ The bank closes billing cycles on the 19th of each month. `periodo_facturacion` 
 
 ### Infrastructure
 
-- **Scraper**: GitHub Actions (`.github/workflows/scraper.yml`), runs daily at 11:00 UTC, also triggerable from Streamlit dashboard via GitHub API.
-- **Dashboard**: Streamlit Cloud (private app), auto-deploys on push to `main`.
-- **Database**: Supabase PostgreSQL (NANO tier, West US Oregon). New projects use IPv6-only direct connection — use Session Pooler (`aws-0-us-west-2.pooler.supabase.com:5432`) for IPv4 compatibility.
-- **Backups**: GitHub Actions (`.github/workflows/backup.yml`), runs daily at 12:00 UTC. Exports all tables to `backups/backup_YYYY-MM-DD.json`, keeps last 7 days. Script: `scripts/backup_db.py`.
+- **Scraper**: GitHub Actions (`.github/workflows/scraper.yml`), triggerable manually or on a daily schedule. Configure the schedule in the workflow file.
+- **Dashboard**: Streamlit Cloud, auto-deploys on push to `main`.
+- **Database**: Supabase PostgreSQL. New Supabase projects may use IPv6-only direct connections — if you have connectivity issues, use the Session Pooler connection string from your project's database settings.
+- **Backups**: GitHub Actions (`.github/workflows/backup.yml`), runs daily. Exports all tables to `backups/backup_YYYY-MM-DD.json`, keeps last 7 days. Script: `scripts/backup_db.py`.
