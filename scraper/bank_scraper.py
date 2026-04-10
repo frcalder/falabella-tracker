@@ -434,9 +434,16 @@ class FalabellaScraper:
         # tx_hash: solo para confirmadas SIN codigo_autorizacion (fallback de identificación).
         # Cuando hay codigo_autorizacion, el conflict target es (codigo_autorizacion, num_cuotas)
         # y tx_hash no se usa — se guarda NULL para no ocupar la constraint UNIQUE.
-        if not pendiente and not codigo_autorizacion:
+        # potential_hash: calculado siempre para limpiar filas antiguas que usaban tx_hash
+        # cuando la misma tx. ahora tiene codigo_autorizacion (evita duplicados en re-scrape).
+        if not pendiente:
             fecha_para_hash = fecha_compra_raw if fecha_compra_raw else f"{fecha_raw}|{periodo_fac}"
-            tx_hash = _make_tx_hash(fecha_para_hash, descripcion, monto_raw)
+            potential_hash = _make_tx_hash(fecha_para_hash, descripcion, monto_raw)
+        else:
+            potential_hash = None
+
+        if not pendiente and not codigo_autorizacion:
+            tx_hash = potential_hash
         else:
             tx_hash = None
 
@@ -464,12 +471,14 @@ class FalabellaScraper:
         cur = self.db_conn.cursor()
         try:
             if codigo_autorizacion:
-                # Si existía una fila pendiente con el mismo tx_hash (sin codigo_autorizacion),
-                # eliminarla antes para evitar conflicto en la constraint UNIQUE de tx_hash.
-                if tx_hash:
+                # Eliminar fila previa sin codigo_autorizacion (guardada con tx_hash) que
+                # corresponde a esta misma transacción. Ocurre cuando el modal no cargó en
+                # un run anterior y ahora sí tiene auth code: sin este DELETE quedarían
+                # dos filas para la misma transacción (duplicados).
+                if potential_hash:
                     cur.execute(
                         "DELETE FROM movimientos WHERE tx_hash = %s AND codigo_autorizacion IS NULL",
-                        (tx_hash,),
+                        (potential_hash,),
                     )
                 cur.execute(
                     """
