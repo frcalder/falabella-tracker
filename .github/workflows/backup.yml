@@ -9,7 +9,25 @@ permissions:
   contents: write
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - id: check
+        env:
+          DB: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ -n "$DB" ]; then
+            echo "configured=true" >> $GITHUB_OUTPUT
+          else
+            echo "configured=false" >> $GITHUB_OUTPUT
+            echo "Secrets not configured — skipping. See README for setup instructions."
+          fi
+
   backup:
+    needs: check
+    if: needs.check.outputs.configured == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

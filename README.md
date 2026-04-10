@@ -169,6 +169,8 @@ Workflows incluidos:
 
 > Los secrets nunca se exponen en los logs ni a forks. Cada persona que haga fork necesita configurar sus propios secrets.
 
+> **Importante:** Los workflows verifican al inicio si los secrets están configurados. Si no lo están, el job se marca como **skipped** (omitido) en lugar de fallar — no recibirás notificaciones de error. Una vez que configures los secrets, los workflows comenzarán a ejecutarse automáticamente en el próximo ciclo programado.
+
 ### 3. Streamlit Cloud (dashboard)
 
 1. Conecta tu fork en [share.streamlit.io](https://share.streamlit.io/)
