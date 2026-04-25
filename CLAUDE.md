@@ -59,9 +59,8 @@ Data is stored in **Supabase PostgreSQL**. The scraper runs daily via **GitHub A
 **Pending movements strategy**: At the start of each run (`_reset_pending()`), all `pendiente=TRUE` rows are deleted from DB. They get re-inserted fresh during the run. This handles deduplication, monto changes, pending→confirmed transitions, and disappeared transactions.
 
 **tx_hash**:
-- Pendientes: `NULL`
-- Confirmadas con `codigo_autorizacion`: `NULL` — auth code is the real identifier; hash is redundant
-- Confirmadas sin `codigo_autorizacion`: `sha256(fecha_compra|descripcion|monto)[:16]` — only fallback identifier
+- Con `codigo_autorizacion`: `NULL` — auth code is the real identifier; hash is redundant
+- Sin `codigo_autorizacion` (pendientes y confirmadas): `sha256(fecha_compra|descripcion|monto)[:16]` — permite clasificar pendientes y que la clasificación persista cuando se confirman (mismo hash, mismos inputs)
 
 **Installment uniqueness**: Two paths depending on whether the bank provides `codigo_autorizacion`:
 - With auth code: `UNIQUE (codigo_autorizacion, num_cuotas)` — one row per installment. Upsert uses `ON CONFLICT (codigo_autorizacion, num_cuotas)`. Migration: `analytics/migrations/002_cuotas_unique.sql`.

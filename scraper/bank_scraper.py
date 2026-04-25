@@ -427,18 +427,15 @@ class FalabellaScraper:
         auth_raw = movement.get("codigo_autorizacion", "") or ""
         codigo_autorizacion = self._normalize_auth(auth_raw) or None
 
-        # tx_hash: solo para confirmadas SIN codigo_autorizacion (fallback de identificación).
+        # tx_hash: para cualquier movimiento SIN codigo_autorizacion (pendientes y confirmados).
         # Cuando hay codigo_autorizacion, el conflict target es (codigo_autorizacion, num_cuotas)
         # y tx_hash no se usa — se guarda NULL para no ocupar la constraint UNIQUE.
-        # potential_hash: calculado siempre para limpiar filas antiguas que usaban tx_hash
-        # cuando la misma tx. ahora tiene codigo_autorizacion (evita duplicados en re-scrape).
-        if not pendiente:
-            fecha_para_hash = fecha_compra_raw if fecha_compra_raw else f"{fecha_raw}|{periodo_fac}"
-            potential_hash = _make_tx_hash(fecha_para_hash, descripcion, monto_raw)
-        else:
-            potential_hash = None
+        # Dar tx_hash a pendientes permite guardar clasificaciones que persisten al confirmarse
+        # (fecha_compra|descripcion|monto es el mismo en pending y confirmed → hash estable).
+        fecha_para_hash = fecha_compra_raw if fecha_compra_raw else f"{fecha_raw}|{periodo_fac}"
+        potential_hash = _make_tx_hash(fecha_para_hash, descripcion, monto_raw)
 
-        if not pendiente and not codigo_autorizacion:
+        if not codigo_autorizacion:
             tx_hash = potential_hash
         else:
             tx_hash = None
