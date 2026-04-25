@@ -66,14 +66,11 @@ JS_CLOSE_MODAL = """
 JS_EXTRACT_FIELDS = """
 () => {
     const LABELS = {
+        'Cuotas': 'modal_cuotas',
         'Rubro': 'rubro',
         'Comercio': 'comercio',
-        'Código autorización': 'codigo_autorizacion',
         'Fecha': 'fecha_compra',
         'Hora': 'hora',
-        'Pais': 'pais',
-        'País': 'pais',
-        'Origen de la compra': 'origen',
     };
 
     function findLeaf(root, text) {
@@ -128,13 +125,20 @@ JS_EXTRACT_FIELDS = """
         if (v) result[key] = v;
     }
 
-    // Dump de todos los pares label→valor del modal (para debug)
+    // Dump de todos los pares label→valor del modal (para debug).
+    // No se filtra por elementos hoja para capturar labels que tengan íconos/spans hijos.
     const allPairs = {};
-    const leafEls = Array.from(modal.querySelectorAll('*')).filter(el => el.children.length === 0 && el.textContent.trim());
-    for (const el of leafEls) {
+    const candidateEls = Array.from(modal.querySelectorAll('*')).filter(el => {
+        const t = el.textContent.trim();
+        return t && t.length < 60;
+    });
+    for (const el of candidateEls) {
+        const t = el.textContent.trim();
+        const childHasSameText = Array.from(el.children).some(c => c.textContent.trim() === t);
+        if (childHasSameText) continue;
         const next = el.nextElementSibling;
-        if (next && next.textContent.trim() && next.children.length === 0) {
-            allPairs[el.textContent.trim()] = next.textContent.trim();
+        if (next && next.textContent.trim()) {
+            allPairs[t] = next.textContent.trim();
         }
     }
     result['_debug_pairs'] = allPairs;
@@ -147,18 +151,18 @@ JS_EXTRACT_FIELDS = """
 # Retorna el bounding rect del botón › (siguiente página) o null
 JS_NEXT_PAGE_RECT = """
 () => {
-    // Busca btn-pagination atravesando shadow roots (el componente está en shadow DOM)
+    // Busca btn-move atravesando shadow roots (botones de paginación circulares)
     function findPagBtns(root) {
         const btns = [];
         for (const el of root.querySelectorAll('*')) {
-            if (el.tagName === 'BUTTON' && el.classList.contains('btn-pagination')) btns.push(el);
+            if (el.tagName === 'BUTTON' && el.classList.contains('btn-move')) btns.push(el);
             if (el.shadowRoot) btns.push(...findPagBtns(el.shadowRoot));
         }
         return btns;
     }
     const pagBtns = findPagBtns(document);
     if (pagBtns.length === 0) return null;
-    // El ÚLTIMO btn-pagination en el DOM siempre es ›; si está disabled, no hay más páginas
+    // El ÚLTIMO btn-move en el DOM siempre es ›; si está disabled, no hay más páginas
     const nextBtn = pagBtns[pagBtns.length - 1];
     if (nextBtn.disabled || nextBtn.hasAttribute('disabled')) return null;
     const r = nextBtn.getBoundingClientRect();
@@ -168,9 +172,6 @@ JS_NEXT_PAGE_RECT = """
     return null;
 }
 """
-
-DATE_RE = re.compile(r"^\d{2}/\d{2}/\d{4}$")
-
 
 def _parse_monto(s: str) -> Optional[float]:
     """Convierte '$ -1.234' o '-$3.712.410' a float preservando el signo."""
@@ -348,9 +349,8 @@ class FalabellaScraper:
             return set()
 
     def _load_incomplete_keys(self) -> set:
-        """Claves fallback de filas confirmadas con campos del modal incompletos.
-        Incluye: filas con auth code pero sin rubro/comercio, y filas sin auth code
-        (podrían tenerlo en una re-visita del modal)."""
+        """Claves de filas confirmadas que faltan rubro o comercio del modal.
+        El banco eliminó 'Código autorización' del modal — ya no se reintenta por auth."""
         try:
             cur = self.db_conn.cursor()
             cur.execute(
@@ -358,8 +358,9 @@ class FalabellaScraper:
                 SELECT fecha, descripcion, monto, num_cuotas FROM movimientos
                 WHERE pendiente = FALSE
                   AND (
-                    codigo_autorizacion IS NULL
-                    OR (rubro IS NULL OR rubro = '' OR comercio IS NULL OR comercio = '')
+                    -- El banco eliminó 'Código autorización' del modal: ya no se reintenta por auth.
+                    -- Solo se reintenta si falta rubro o comercio (campos que sí siguen en el modal).
+                    rubro IS NULL OR rubro = '' OR comercio IS NULL OR comercio = ''
                   )
                 """
             )
@@ -390,9 +391,6 @@ class FalabellaScraper:
             self.db_conn.commit()
             cur.close()
             if n > 0:
-                # Remover claves de pendientes del checkpoint (fecha vacía)
-                self.existing_keys = {k for k in self.existing_keys
-                                      if not (isinstance(k, tuple) and k[0] == "")}
                 logger.info(f"Reseteados {n} pendientes para re-procesar")
         except Exception:
             self.db_conn.rollback()
@@ -428,8 +426,6 @@ class FalabellaScraper:
         # Normalizar codigo_autorizacion antes del hash para poder incluirlo
         auth_raw = movement.get("codigo_autorizacion", "") or ""
         codigo_autorizacion = self._normalize_auth(auth_raw) or None
-
-        num_cuotas_raw = str(movement.get("num_cuotas", "") or "").strip()
 
         # tx_hash: solo para confirmadas SIN codigo_autorizacion (fallback de identificación).
         # Cuando hay codigo_autorizacion, el conflict target es (codigo_autorizacion, num_cuotas)
@@ -528,7 +524,7 @@ class FalabellaScraper:
                          %(fecha_compra)s, %(hora)s, %(pais)s, %(origen)s,
                          %(periodo_facturacion)s, %(periodo)s, %(num_cuotas)s,
                          %(valor_cuota)s, %(tx_hash)s, NOW())
-                    ON CONFLICT (tx_hash) DO UPDATE SET
+                    ON CONFLICT (tx_hash, periodo) WHERE tx_hash IS NOT NULL DO UPDATE SET
                         fecha             = EXCLUDED.fecha,
                         descripcion       = EXCLUDED.descripcion,
                         persona           = EXCLUDED.persona,
@@ -679,10 +675,9 @@ class FalabellaScraper:
             "num_cuotas": texts[4].strip() if len(texts) > 4 else "",
             "valor_cuota": texts[5].strip() if len(texts) > 5 else "",
         }
-        if DATE_RE.match(first):
-            return {"pendiente": False, "fecha": first, **base}
-        else:
-            return {"pendiente": True, "fecha": "", **base}
+        # Todos los movimientos (confirmados y pendientes) ahora aparecen en la misma tabla
+        # con fecha. La detección de pendiente se hace desde el modal (campo 'Cuotas').
+        return {"pendiente": False, "fecha": first, **base}
 
     # ------------------------------------------------------------------ #
     # Detalle                                                              #
@@ -722,18 +717,22 @@ class FalabellaScraper:
         except Exception:
             pass
 
-        # Esperar activamente a que "Código autorización" aparezca en el shadow DOM (hasta 8s)
+        # Esperar a que el modal tenga contenido real: buscamos 'Comercio' en el shadow DOM.
+        # El banco eliminó 'Código autorización' del modal — ya no se usa como señal de carga.
         try:
             await page.wait_for_function(
                 """() => {
                     function hasLabel(root, text) {
                         for (const el of root.querySelectorAll('*')) {
-                            if (el.children.length === 0 && el.textContent.trim() === text) return true;
+                            if (el.textContent.trim() === text) {
+                                const childHasIt = Array.from(el.children).some(c => c.textContent.trim() === text);
+                                if (!childHasIt) return true;
+                            }
                             if (el.shadowRoot && hasLabel(el.shadowRoot, text)) return true;
                         }
                         return false;
                     }
-                    return hasLabel(document, 'Código autorización');
+                    return hasLabel(document, 'Comercio');
                 }""",
                 timeout=8000,
             )
@@ -835,22 +834,23 @@ class FalabellaScraper:
 
                 key = self._movement_key(movement)
 
-                # Saltar solo si ya está confirmado (con fecha), completo y no incompleto
-                if movement.get("fecha") and key in self.existing_keys and key not in self.incomplete_keys:
+                # Saltar solo si es confirmado (tiene num_cuotas), ya está en DB y no está incompleto.
+                # Pendientes nunca tienen num_cuotas → siempre se procesan sin importar existing_keys.
+                if movement.get("num_cuotas") and key in self.existing_keys and key not in self.incomplete_keys:
                     logger.info(f"  [{i+1}/{total_rows}] Ya procesado — {movement.get('descripcion', '?')}")
                     continue
-                if movement.get("fecha") and key in self.incomplete_keys:
+                if movement.get("num_cuotas") and key in self.incomplete_keys:
                     logger.info(f"  [{i+1}/{total_rows}] Incompleto, re-descargando — {movement.get('descripcion', '?')}")
 
+                detail = await self._open_and_read_detail(page, i)
+                # Pendiente = modal sin campo 'Cuotas' (confirmados siempre lo muestran)
+                movement["pendiente"] = not bool(detail.pop("modal_cuotas", None))
+                movement.update(detail)
                 status = "pendiente" if movement["pendiente"] else "confirmado"
                 logger.info(
                     f"  [{i+1}/{total_rows}] ({status}) "
                     f"{movement.get('descripcion', '?')} — {movement.get('monto', '?')}"
                 )
-                detail = await self._open_and_read_detail(page, i)
-                if not movement["fecha"] and "fecha_compra" in detail:
-                    movement["fecha"] = detail["fecha_compra"]
-                movement.update(detail)
                 movement["periodo_facturacion"] = self.periodo_facturacion
 
                 is_new = key not in self.existing_keys

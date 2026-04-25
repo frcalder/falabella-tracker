@@ -56,11 +56,19 @@ CREATE TABLE IF NOT EXISTS movimientos (
     periodo             TEXT,
     num_cuotas          TEXT,
     valor_cuota         NUMERIC,
-    tx_hash             TEXT UNIQUE,
+    tx_hash             TEXT,
     created_at          TIMESTAMP DEFAULT NOW(),
     updated_at          TIMESTAMP DEFAULT NOW(),
     UNIQUE (codigo_autorizacion, num_cuotas)
 );
+
+-- Partial unique index: una fila por (compra, período) para movimientos sin codigo_autorizacion.
+-- tx_hash = sha256(fecha_compra|desc|monto) — por compra, no por cuota, para que
+-- clasificaciones apliquen a todas las cuotas a la vez. Dentro de un período siempre
+-- hay exactamente una cuota por compra, así que (tx_hash, periodo) es único.
+CREATE UNIQUE INDEX IF NOT EXISTS movimientos_tx_hash_periodo_idx
+    ON movimientos (tx_hash, periodo)
+    WHERE tx_hash IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS scraper_runs (
     id              SERIAL PRIMARY KEY,

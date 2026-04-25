@@ -46,24 +46,26 @@ Data is stored in **Supabase PostgreSQL**. The scraper runs daily via **GitHub A
 **`scraper/bank_scraper.py`** — the active scraper (Playwright async). Writes directly to Supabase via psycopg2.
 
 **Shadow DOM traversal pattern**: Three JS constants handle the main interactions:
-- `JS_EXTRACT_FIELDS` — finds the detail modal by searching for anchor label pairs (`Rubro`+`Hora`, etc.) then climbs the DOM to a container that has both. Extracts label→value pairs for `rubro`, `comercio`, `codigo_autorizacion`, `fecha_compra`, `hora`, `pais`, `origen`. Uses `wait_for_function` to wait for `Código autorización` to appear before extracting (headless timing fix).
+- `JS_EXTRACT_FIELDS` — finds the detail modal by searching for anchor label pairs (`Rubro`+`Hora`, etc.) then climbs the DOM to a container that has both. Extracts label→value pairs for `rubro`, `comercio`, `modal_cuotas`, `fecha_compra`, `hora`. Uses `wait_for_function` to wait for `Comercio` to appear before extracting (headless timing fix). `modal_cuotas` present = confirmed, absent = pending.
 - `JS_CLOSE_MODAL` — traverses shadow roots looking for a × button, falls back to backdrop click.
-- `JS_NEXT_PAGE_RECT` — finds all `btn-pagination` class buttons (SVG only, no text), returns bounding rect of the last one (next›). Returns `null` if that button is disabled (last page).
+- `JS_NEXT_PAGE_RECT` — finds all `btn-move` class buttons (SVG only, no text), returns bounding rect of the last one (next›). Returns `null` if that button is disabled (last page).
 
-**Two table sections**: The movements page has "Pendientes de confirmación" (no date, clock icon) followed by confirmed movements (with date). `_read_row` detects pending via presence of the clock icon element.
+**Single table**: All movements (pending and confirmed) appear in one table with dates. Pending movements have no value in the cuotas column (`/`). `_read_row` always returns `pendiente=False`; the real signal comes from the modal (`modal_cuotas` absent = pending).
 
-**Checkpoint / resume**: `existing_keys` (loaded from DB at init) tracks processed confirmed movements. Key format: `(fecha, descripcion, abs(monto_int), num_cuotas)` — derived from table columns, available before opening the modal. `num_cuotas` differentiates installments of the same purchase (e.g. cuota 01/03 vs 02/03). The skip check only applies to confirmed movements (`fecha` truthy) — pending are always re-processed. Monto is normalized to int for comparison between raw cell text and DB Decimal.
+**Checkpoint / resume**: `existing_keys` (loaded from DB at init) tracks processed confirmed movements. Key format: `(fecha, descripcion, abs(monto_int), num_cuotas)` — derived from table columns, available before opening the modal. `num_cuotas` differentiates installments of the same purchase (e.g. cuota 01/03 vs 02/03). The skip check only applies to confirmed movements (`num_cuotas` truthy) — pending have no cuota value and are always re-processed. Monto is normalized to int for comparison between raw cell text and DB Decimal.
 
-`incomplete_keys` holds confirmed rows missing `codigo_autorizacion`, `rubro`, or `comercio`. If a movement's key is in `incomplete_keys`, it is re-processed even if already in `existing_keys`, allowing a later scraper run to fill in modal data that failed previously.
+`incomplete_keys` holds confirmed rows missing `rubro` or `comercio`. If a movement's key is in `incomplete_keys`, it is re-processed even if already in `existing_keys`, allowing a later scraper run to fill in modal data that failed previously.
 
-**Pending movements strategy**: At the start of each run (`_reset_pending()`), all `pendiente=TRUE` rows are deleted from DB. They get re-inserted fresh during the run. This handles deduplication, monto changes, pending→confirmed transitions, and disappeared transactions. Pending movements have `codigo_autorizacion` from the bank, so classifications made on pending rows persist automatically when the movement is confirmed — no re-classification needed.
+**Pending movements strategy**: At the start of each run (`_reset_pending()`), all `pendiente=TRUE` rows are deleted from DB. They get re-inserted fresh during the run. This handles deduplication, monto changes, pending→confirmed transitions, and disappeared transactions.
 
 **tx_hash**:
 - Pendientes: `NULL`
 - Confirmadas con `codigo_autorizacion`: `NULL` — auth code is the real identifier; hash is redundant
 - Confirmadas sin `codigo_autorizacion`: `sha256(fecha_compra|descripcion|monto)[:16]` — only fallback identifier
 
-**Installment uniqueness**: The UNIQUE constraint on `movimientos` is `(codigo_autorizacion, num_cuotas)` — not just `codigo_autorizacion`. This allows one row per installment (cuota 01/03, 02/03, 03/03) of the same purchase. The upsert uses `ON CONFLICT (codigo_autorizacion, num_cuotas)`. Migration: `analytics/migrations/002_cuotas_unique.sql`.
+**Installment uniqueness**: Two paths depending on whether the bank provides `codigo_autorizacion`:
+- With auth code: `UNIQUE (codigo_autorizacion, num_cuotas)` — one row per installment. Upsert uses `ON CONFLICT (codigo_autorizacion, num_cuotas)`. Migration: `analytics/migrations/002_cuotas_unique.sql`.
+- Without auth code (current bank behavior since ~2026-03): `tx_hash = sha256(fecha_compra|descripcion|monto)` per purchase. Uniqueness via partial index `(tx_hash, periodo) WHERE tx_hash IS NOT NULL` — within a period there is exactly one cuota per purchase. Upsert uses `ON CONFLICT (tx_hash, periodo)`. Migration: `analytics/migrations/005_tx_hash_cuotas_unique.sql`.
 
 **Pagination**: `_go_next_page` uses `wait_for_function` to detect when the first row text changes after clicking next, avoiding false loop detection when all rows are skipped.
 
@@ -98,7 +100,7 @@ Split key is `codigo_autorizacion` alone (same as `clasificaciones`) — a split
 
 | Column | Notes |
 |---|---|
-| `fecha` | Display date (NULL for pending) |
+| `fecha` | Display date (all movements have a date, including pending) |
 | `descripcion` | Transaction description |
 | `persona` | TITULAR / additional cardholder |
 | `monto` | Amount |
@@ -106,11 +108,11 @@ Split key is `codigo_autorizacion` alone (same as `clasificaciones`) — a split
 | `pendiente` | TRUE if unconfirmed |
 | `rubro` | Category from bank modal |
 | `comercio` | Merchant name from modal |
-| `codigo_autorizacion` | Auth code — part of composite unique key `(codigo_autorizacion, num_cuotas)` |
+| `codigo_autorizacion` | Auth code — part of composite unique key `(codigo_autorizacion, num_cuotas)`. Bank stopped serving this field ~2026-03; always NULL for new transactions. |
 | `fecha_compra` | Purchase date from modal (may differ from `fecha`) |
 | `hora` | Purchase time from modal |
-| `pais` | Country |
-| `origen` | Purchase origin type |
+| `pais` | Country — bank stopped serving this field ~2026-03; always NULL |
+| `origen` | Purchase origin type — bank stopped serving this field ~2026-03; always NULL |
 | `periodo_facturacion` | "DD/MM/YYYY" closing date of billing cycle |
 | `periodo` | "YYYY-MM" derived from `periodo_facturacion` |
 | `num_cuotas` | Number of installments |
@@ -127,7 +129,32 @@ The bank closes billing cycles on the 19th of each month. `periodo_facturacion` 
 
 ### Infrastructure
 
-- **Scraper**: GitHub Actions (`.github/workflows/scraper.yml`), triggerable manually or on a daily schedule. Configure the schedule in the workflow file.
-- **Dashboard**: Streamlit Cloud, auto-deploys on push to `main`.
-- **Database**: Supabase PostgreSQL. New Supabase projects may use IPv6-only direct connections — if you have connectivity issues, use the Session Pooler connection string from your project's database settings.
-- **Backups**: GitHub Actions (`.github/workflows/backup.yml`), runs daily. Exports all tables to `backups/backup_YYYY-MM-DD.json`, keeps last 7 days. Script: `scripts/backup_db.py`.
+- **Scraper**: GitHub Actions (`.github/workflows/scraper.yml`), runs daily at 11:00 UTC, also triggerable from Streamlit dashboard via GitHub API.
+- **Dashboard**: Streamlit Cloud (private app), auto-deploys on push to `main`.
+- **Database**: Supabase PostgreSQL (NANO tier, West US Oregon). New projects use IPv6-only direct connection — use Session Pooler (`aws-0-us-west-2.pooler.supabase.com:5432`) for IPv4 compatibility.
+- **Backups**: GitHub Actions (`.github/workflows/backup.yml`), runs daily at 12:00 UTC. Exports all tables to `backups/backup_YYYY-MM-DD.json`, keeps last 7 days. Script: `scripts/backup_db.py`.
+
+## Workflow for bugs and features
+
+### Bug workflow
+
+1. **Identify** — reproduce or confirm the symptom (dashboard, DB query, or scraper log).
+2. **Trace** — read the relevant files before touching anything. For data bugs: start from `loader.py` (how data is read) → `bank_scraper.py` (how data is written). For display bugs: start from the dashboard page → `loader.py`.
+3. **Check the DB** — if the bug could have already corrupted data, query Supabase directly to assess the damage before fixing code.
+4. **Fix** — minimal change. Don't refactor surrounding code.
+5. **Clean DB if needed** — write a safe SELECT first to verify scope, then DELETE/UPDATE. Always show the SELECT result before running destructive SQL.
+6. **Commit to `gastos-falabella`** — `git pull` first if behind origin, then commit and push.
+7. **Mirror to `falabella-tracker`** — clone to `/tmp/falabella-tracker`, apply the same change, commit and push. This is the public repo that others fork.
+8. **Document in `CHANGELOG.md`** — add an entry in both repos with: symptom, root cause, fix summary, and DB cleanup SQL if applicable.
+
+### Feature workflow
+
+1. **Understand before building** — read the files that will be touched. Check if the DB schema needs changes (migrations go in `analytics/migrations/`).
+2. **DB migrations** — add a new `.sql` file in `analytics/migrations/` and apply it in the Supabase SQL Editor (DDL like `CREATE INDEX` and `ALTER TABLE` hits statement timeout through the session pooler — must run from the SQL Editor directly). Update `analytics/schema.sql` to reflect the final state.
+3. **Code** — implement in the relevant layer (scraper, loader, repository, dashboard page).
+4. **Test locally** — run `pipenv run python main.py --mode scraper --limit 1` to test scraper changes. Run `pipenv run streamlit run dashboard/visualizer.py` for dashboard changes.
+5. **Commit, mirror, document** — same as steps 6–8 of the bug workflow.
+
+### Two-repo rule
+
+Every fix or feature that touches `scraper/`, `analytics/`, or `dashboard/` must be mirrored to `frcalder/falabella-tracker` (the public template). Backups, secrets, and personal data never go there. The `CHANGELOG.md` in `falabella-tracker` should include DB cleanup instructions since other users may have the same data issue.
