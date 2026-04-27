@@ -81,27 +81,29 @@ if df_view.empty:
     st.success("No hay transacciones para mostrar con los filtros actuales.")
     st.stop()
 
-# ── Tabla editable ────────────────────────────────────────────────────────────
+# ── Tabla ─────────────────────────────────────────────────────────────────────
 categorias = get_categorias(conn)
 cat_nombres = ["(sin clasificar)"] + [c.nombre for c in categorias]
 cat_id_map = {c.nombre: c.id for c in categorias}
 
-# Preparar columnas para mostrar
-cols_display = ["fecha_compra", "descripcion", "comercio", "rubro", "monto", "pendiente",
-                "categoria_nombre", "codigo_autorizacion", "num_cuotas", "tx_hash", "is_split"]
-cols_display = [c for c in cols_display if c in df_view.columns]
+# df_sorted: todas las columnas, índice 0..N-1 (para lookup al seleccionar fila)
+df_sorted = df_view.copy()
+df_sorted["fecha_compra"] = pd.to_datetime(df_sorted["fecha_compra"], errors="coerce")
+df_sorted = df_sorted.sort_values("fecha_compra", ascending=False).reset_index(drop=True)
 
-df_edit = df_view[cols_display].copy()
-df_edit["fecha_compra"] = pd.to_datetime(df_edit["fecha_compra"], errors="coerce")
-df_edit = df_edit.sort_values("fecha_compra", ascending=False)
-df_edit["fecha_compra"] = df_edit["fecha_compra"].dt.strftime("%d/%m/%Y").fillna("—")
-df_edit["categoria_nombre"] = df_edit["categoria_nombre"].fillna("(sin clasificar)")
-df_edit["monto"] = df_edit["monto"].apply(lambda x: f"${x:,.0f}")
-df_edit = df_edit.reset_index(drop=True)
+# df_display: solo columnas visibles, valores formateados
+cols_visible = ["fecha_compra", "descripcion", "comercio", "rubro", "monto", "pendiente", "categoria_nombre"]
+cols_visible = [c for c in cols_visible if c in df_sorted.columns]
 
-# Columna editable de categoría
-edited = st.data_editor(
-    df_edit,
+df_display = df_sorted[cols_visible].copy()
+df_display["fecha_compra"] = df_sorted["fecha_compra"].dt.strftime("%d/%m/%Y").fillna("—")
+df_display["categoria_nombre"] = df_display["categoria_nombre"].fillna("(sin clasificar)")
+df_display["monto"] = df_sorted["monto"].apply(lambda x: f"${x:,.0f}")
+
+st.caption("Haz clic en una fila para clasificar o dividir.")
+
+event = st.dataframe(
+    df_display,
     column_config={
         "fecha_compra": st.column_config.TextColumn("Fecha", width="small"),
         "descripcion": st.column_config.TextColumn("Descripción", width="medium"),
@@ -109,140 +111,120 @@ edited = st.data_editor(
         "rubro": st.column_config.TextColumn("Rubro", width="medium"),
         "monto": st.column_config.TextColumn("Monto", width="small"),
         "pendiente": st.column_config.CheckboxColumn("Pendiente", width="small"),
-        "categoria_nombre": st.column_config.SelectboxColumn(
-            "Categoría", options=cat_nombres, width="medium"
-        ),
-        "codigo_autorizacion": None,
-        "num_cuotas": None,
-        "tx_hash": None,
-        "is_split": None,
+        "categoria_nombre": st.column_config.TextColumn("Categoría", width="medium"),
     },
-    disabled=["fecha_compra", "descripcion", "comercio", "rubro", "monto", "pendiente"],
     hide_index=True,
-    num_rows="dynamic",
-    width="stretch",
+    on_select="rerun",
+    selection_mode="single-row",
+    use_container_width=True,
     key="tabla_clasificacion",
 )
 
-# ── Guardar cambios ───────────────────────────────────────────────────────────
-if st.button("Guardar clasificaciones", type="primary"):
-    cambios = 0
-    eliminados = 0
+# ── Panel de acción para fila seleccionada ────────────────────────────────────
+sel_rows = event.selection.rows
+if not sel_rows:
+    st.info("Selecciona una fila para clasificar o dividir.")
+else:
+    sel_idx = sel_rows[0]
+    row = df_sorted.iloc[sel_idx]
 
-    # Filas editadas (categoría cambiada)
-    for idx, row in edited.iterrows():
-        if idx not in df_edit.index:
-            continue  # fila nueva agregada (ignorar)
-        nueva_cat = row["categoria_nombre"]
-        if nueva_cat in ("(sin clasificar)", "✂ DIVIDIDO"):
-            continue
-        if nueva_cat == df_edit.loc[idx, "categoria_nombre"]:
-            continue
-        categoria_id = cat_id_map.get(nueva_cat)
-        if not categoria_id:
-            continue
-        cod_aut = df_edit.loc[idx, "codigo_autorizacion"]
-        tx_hash = df_edit.loc[idx, "tx_hash"]
-        comercio = str(df_edit.loc[idx, "comercio"]).strip() or None
-        # Si era split y ahora se asigna categoría directa, eliminar splits primero
-        if df_edit.loc[idx, "is_split"]:
-            delete_splits(conn, cod_aut, tx_hash)
-        clasificar(conn, cod_aut, tx_hash, categoria_id, comercio, origen="manual")
-        cambios += 1
+    cod_aut = row.get("codigo_autorizacion") or None
+    tx_hash_val = row.get("tx_hash") or None
+    is_split = bool(row.get("is_split"))
+    monto_ref = float(row.get("monto_periodo") or row.get("monto") or 0)
 
-    # Filas eliminadas (quitar clasificación)
-    deleted_indices = set(df_edit.index) - set(edited.index)
-    for idx in deleted_indices:
-        cod_aut = df_edit.loc[idx, "codigo_autorizacion"]
-        tx_hash = df_edit.loc[idx, "tx_hash"]
-        if not cod_aut and not tx_hash:
-            continue
-        delete_clasificacion(conn, cod_aut, tx_hash)
-        eliminados += 1
+    fecha_str = row["fecha_compra"].strftime("%d/%m/%Y") if pd.notna(row.get("fecha_compra")) else "—"
+    prefix = "⏳ " if row.get("pendiente") else ""
+    st.subheader(f"{prefix}{fecha_str} — {row['descripcion']} — ${monto_ref:,.0f}")
 
-    if cambios or eliminados:
-        get_data.clear()
-        partes = []
-        if cambios:
-            partes.append(f"{cambios} clasificaciones guardadas")
-        if eliminados:
-            partes.append(f"{eliminados} clasificaciones eliminadas")
-        st.success(". ".join(partes) + ".")
-        st.rerun()
-    else:
-        st.info("No hubo cambios para guardar.")
+    tab_clasificar, tab_dividir = st.tabs(["Clasificar", "✂ Dividir"])
 
-# ── Dividir movimiento ────────────────────────────────────────────────────────
-st.divider()
-with st.expander("✂ Dividir movimiento"):
-    txs_conf = df_view[df_view["codigo_autorizacion"].notna()].reset_index(drop=True)
-    if txs_conf.empty:
-        st.info("No hay movimientos con código de autorización en este período.")
-    else:
-        labels = []
-        for _, r in txs_conf.iterrows():
-            prefix = "⏳ " if r.get("pendiente") else ""
-            fecha_str = r["fecha_compra"].strftime("%d/%m") if pd.notna(r.get("fecha_compra")) else "—"
-            labels.append(f"{prefix}{fecha_str} — {r['descripcion']} — ${r['monto_periodo']:,.0f}")
-
-        sel_i = st.selectbox("Transacción a dividir", range(len(labels)),
-                             format_func=lambda i: labels[i], key="split_tx_sel")
-        tx_row = txs_conf.iloc[sel_i]
-        monto_ref = float(tx_row.get("monto_periodo") or 0)
-        cod_aut = tx_row.get("codigo_autorizacion") or None
-        tx_hash_val = tx_row.get("tx_hash") or None
-
-        splits_actuales = get_splits(conn, cod_aut, tx_hash_val)
-        if splits_actuales:
-            splits_df = pd.DataFrame(splits_actuales)[["categoria_nombre", "monto"]].reset_index(drop=True)
-        else:
-            splits_df = pd.DataFrame({"categoria_nombre": [None], "monto": [0.0]})
-
-        splits_edited = st.data_editor(
-            splits_df,
-            column_config={
-                "categoria_nombre": st.column_config.SelectboxColumn(
-                    "Categoría", options=[c.nombre for c in categorias], width="medium"
-                ),
-                "monto": st.column_config.NumberColumn(
-                    "Monto", format="$%,.0f", min_value=0, width="small"
-                ),
-            },
-            num_rows="dynamic",
-            hide_index=True,
-            key="split_editor",
+    with tab_clasificar:
+        cat_actual = row.get("categoria_nombre") or "(sin clasificar)"
+        if cat_actual not in cat_nombres:
+            cat_actual = "(sin clasificar)"
+        nueva_cat = st.selectbox(
+            "Categoría",
+            options=cat_nombres,
+            index=cat_nombres.index(cat_actual),
+            key="sel_cat_fila",
         )
-
-        total_asignado = float(splits_edited["monto"].fillna(0).sum())
-        diferencia = monto_ref - total_asignado
-        st.caption(
-            f"Referencia: **${monto_ref:,.0f}** | "
-            f"Asignado: **${total_asignado:,.0f}** | "
-            f"Diferencia: **${diferencia:,.0f}**"
-        )
-
         col_save, col_del = st.columns([2, 1])
         with col_save:
-            if st.button("Guardar split", type="primary", key="btn_guardar_split"):
-                filas = [
-                    {"categoria_id": cat_id_map[r["categoria_nombre"]], "monto": float(r["monto"])}
-                    for _, r in splits_edited.iterrows()
-                    if r.get("categoria_nombre") in cat_id_map and (r.get("monto") or 0) > 0
-                ]
-                if not filas:
-                    st.warning("Agrega al menos una fila con categoría y monto.")
+            if st.button("Guardar clasificación", type="primary", key="btn_guardar_cat"):
+                if nueva_cat in ("(sin clasificar)", "✂ DIVIDIDO"):
+                    st.warning("Selecciona una categoría válida.")
                 else:
-                    delete_clasificacion(conn, cod_aut, tx_hash_val)
-                    upsert_splits(conn, cod_aut, tx_hash_val, filas)
+                    categoria_id = cat_id_map[nueva_cat]
+                    comercio = str(row.get("comercio") or "").strip() or None
+                    if is_split:
+                        delete_splits(conn, cod_aut, tx_hash_val)
+                    clasificar(conn, cod_aut, tx_hash_val, categoria_id, comercio, origen="manual")
                     get_data.clear()
-                    st.success(f"Split guardado en {len(filas)} partes.")
+                    st.success(f"Clasificado como {nueva_cat}.")
                     st.rerun()
         with col_del:
-            if st.button("Eliminar split", key="btn_eliminar_split"):
-                delete_splits(conn, cod_aut, tx_hash_val)
+            if st.button("Quitar clasificación", key="btn_quitar_cat"):
+                delete_clasificacion(conn, cod_aut, tx_hash_val)
                 get_data.clear()
-                st.success("Split eliminado.")
+                st.success("Clasificación eliminada.")
                 st.rerun()
+
+    with tab_dividir:
+        if not cod_aut and not tx_hash_val:
+            st.warning("Este movimiento no tiene identificador — no se puede dividir.")
+        else:
+            splits_actuales = get_splits(conn, cod_aut, tx_hash_val)
+            if splits_actuales:
+                splits_df = pd.DataFrame(splits_actuales)[["categoria_nombre", "monto"]].reset_index(drop=True)
+            else:
+                splits_df = pd.DataFrame({"categoria_nombre": [None], "monto": [0.0]})
+
+            splits_edited = st.data_editor(
+                splits_df,
+                column_config={
+                    "categoria_nombre": st.column_config.SelectboxColumn(
+                        "Categoría", options=[c.nombre for c in categorias], width="medium"
+                    ),
+                    "monto": st.column_config.NumberColumn(
+                        "Monto", format="$%,.0f", min_value=0, width="small"
+                    ),
+                },
+                num_rows="dynamic",
+                hide_index=True,
+                key="split_editor",
+            )
+
+            total_asignado = float(splits_edited["monto"].fillna(0).sum())
+            diferencia = monto_ref - total_asignado
+            st.caption(
+                f"Referencia: **${monto_ref:,.0f}** | "
+                f"Asignado: **${total_asignado:,.0f}** | "
+                f"Diferencia: **${diferencia:,.0f}**"
+            )
+
+            col_save_split, col_del_split = st.columns([2, 1])
+            with col_save_split:
+                if st.button("Guardar split", type="primary", key="btn_guardar_split"):
+                    filas = [
+                        {"categoria_id": cat_id_map[r["categoria_nombre"]], "monto": float(r["monto"])}
+                        for _, r in splits_edited.iterrows()
+                        if r.get("categoria_nombre") in cat_id_map and (r.get("monto") or 0) > 0
+                    ]
+                    if not filas:
+                        st.warning("Agrega al menos una fila con categoría y monto.")
+                    else:
+                        delete_clasificacion(conn, cod_aut, tx_hash_val)
+                        upsert_splits(conn, cod_aut, tx_hash_val, filas)
+                        get_data.clear()
+                        st.success(f"Split guardado en {len(filas)} partes.")
+                        st.rerun()
+            with col_del_split:
+                if st.button("Eliminar split", key="btn_eliminar_split"):
+                    delete_splits(conn, cod_aut, tx_hash_val)
+                    get_data.clear()
+                    st.success("Split eliminado.")
+                    st.rerun()
 
 # ── Panel de sugerencias ──────────────────────────────────────────────────────
 st.divider()
