@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-04-27
+
+### Feat: rediseño UX de splits en Clasificación
+
+**Problema:** El panel "✂ Dividir movimiento" usaba un `selectbox` que defaulteaba siempre al primer movimiento de la lista. Al abrir el expander sin revisar la selección era fácil guardar un split accidentalmente sobre la transacción equivocada.
+
+**Solución (`dashboard/pages/01_Clasificacion.py`):**
+- La tabla principal cambia de `st.data_editor` (con edición inline) a `st.dataframe` con `selection_mode="single-row"` y `on_select="rerun"`.
+- Al hacer clic en una fila aparece un panel de acción debajo de la tabla con el contexto de esa transacción y dos tabs: **Clasificar** y **✂ Dividir**.
+- La tab "Dividir" solo es accesible tras seleccionar explícitamente una fila, eliminando el riesgo de split accidental.
+- La clasificación pasa de edición inline masiva a un selectbox por fila con botón "Guardar clasificación" / "Quitar clasificación".
+
 ## 2026-04-25
 
 ### Fix: adaptación a cambios de UI del Banco Falabella (~2026-03)
