@@ -430,10 +430,13 @@ class FalabellaScraper:
         # tx_hash: para cualquier movimiento SIN codigo_autorizacion (pendientes y confirmados).
         # Cuando hay codigo_autorizacion, el conflict target es (codigo_autorizacion, num_cuotas)
         # y tx_hash no se usa — se guarda NULL para no ocupar la constraint UNIQUE.
-        # Dar tx_hash a pendientes permite guardar clasificaciones que persisten al confirmarse
-        # (fecha_compra|descripcion|monto es el mismo en pending y confirmed → hash estable).
+        # Dar tx_hash a pendientes permite guardar clasificaciones que persisten al confirmarse.
+        # Normalizar descripción antes del hash: el banco usa mixed-case con asterisco final en
+        # pendientes ("COMPRA SumUp * Isidora*") y mayúsculas sin asterisco en confirmados
+        # ("COMPRA SUMUP * ISIDORA") — la misma transacción daría hashes distintos sin normalizar.
         fecha_para_hash = fecha_compra_raw if fecha_compra_raw else f"{fecha_raw}|{periodo_fac}"
-        potential_hash = _make_tx_hash(fecha_para_hash, descripcion, monto_raw)
+        desc_para_hash = descripcion.rstrip("*").strip().upper()
+        potential_hash = _make_tx_hash(fecha_para_hash, desc_para_hash, monto_raw)
 
         if not codigo_autorizacion:
             tx_hash = potential_hash
