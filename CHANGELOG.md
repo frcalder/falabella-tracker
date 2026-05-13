@@ -1,5 +1,34 @@
 # Changelog
 
+## 2026-05-13
+
+### Fix: soporte dual-estructura UI banco + logging silenciado + migración de clasificaciones
+
+**Síntoma:** El banco Falabella revirtió su frontend a la estructura anterior (~2026-03), causando tres problemas simultáneos:
+1. El scraper sólo procesaba la primera página (paginación rota).
+2. Movimientos pendientes eran guardados como confirmados (`pendiente=FALSE`).
+3. Las clasificaciones se perdían al pasar un movimiento de pendiente a confirmado.
+4. Ningún log era visible en las ejecuciones de GitHub Actions (logging completamente silenciado).
+
+**Causa raíz:**
+- `JS_NEXT_PAGE_RECT` sólo buscaba `btn-move` (nueva estructura); la antigua usa `btn-pagination`.
+- La detección de pendiente usaba únicamente `modal_cuotas`, que no existe en la estructura antigua. En estructura antigua, tanto confirmados como pendientes tienen `Código autorización` en el modal; el único discriminador confiable es la presencia de fecha en la fila de la tabla.
+- Al confirmar una transacción, `clasificaciones` y `splits` no se migraban si cambiaba la llave (`tx_hash → codigo_autorizacion` o `tx_hash → tx_hash` distinto).
+- `logging.getLogger("root")` retorna el logger raíz de Python (porque `root.name == 'root'`), por lo que `setLevel(CRITICAL)` silenciaba todo el output.
+
+**Fix (`scraper/bank_scraper.py`):**
+- `JS_NEXT_PAGE_RECT`: busca `btn-move` (nueva) y `btn-pagination` (antigua) en paralelo.
+- `JS_EXTRACT_FIELDS`: restaura labels `Código autorización`, `Pais`/`País`, `Origen de la compra` como opcionales.
+- `wait_for_function`: acepta `Comercio` OR `Código autorización` como señal de carga del modal.
+- `_read_row`: restaura `DATE_RE` como fallback para detectar pendientes en estructura antigua (sin fecha).
+- Detección de pendiente multi-señal en `extract_all_movements`:
+  - Si modal tiene `Código autorización` → estructura antigua → usar DATE_RE (sin fecha = pendiente).
+  - Si modal cargó sin auth → estructura nueva → usar `modal_cuotas`.
+  - Si modal no cargó → DATE_RE como fallback.
+- `_save_pending_hashes()`: guarda `{(desc_norm, monto_norm): tx_hash}` de todos los pendientes antes de `_reset_pending()`.
+- `_upsert_to_db`: al confirmar, migra `clasificaciones` y `splits` del hash pendiente al nuevo identificador (ya sea nuevo `tx_hash` o `codigo_autorizacion`), en la misma transacción DB. `NOT EXISTS` previene sobrescribir clasificaciones existentes.
+- Logging: reemplaza `getLogger("root").setLevel(CRITICAL)` por silenciar sólo loggers específicos (`urllib3`, `asyncio`, `playwright`).
+
 ## 2026-04-27
 
 ### Feat: rediseño UX de splits en Clasificación

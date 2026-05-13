@@ -23,7 +23,8 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
-logging.getLogger("root").setLevel(logging.CRITICAL)  # silencia warnings de hashlib/OpenSSL
+for _noisy in ("urllib3", "asyncio", "playwright"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 DEBUG_DIR = Path("debug")
 
@@ -69,8 +70,12 @@ JS_EXTRACT_FIELDS = """
         'Cuotas': 'modal_cuotas',
         'Rubro': 'rubro',
         'Comercio': 'comercio',
+        'Código autorización': 'codigo_autorizacion',
         'Fecha': 'fecha_compra',
         'Hora': 'hora',
+        'Pais': 'pais',
+        'País': 'pais',
+        'Origen de la compra': 'origen',
     };
 
     function findLeaf(root, text) {
@@ -151,11 +156,14 @@ JS_EXTRACT_FIELDS = """
 # Retorna el bounding rect del botón › (siguiente página) o null
 JS_NEXT_PAGE_RECT = """
 () => {
-    // Busca btn-move atravesando shadow roots (botones de paginación circulares)
+    // Busca botones de paginación atravesando shadow roots.
+    // btn-move = estructura nueva (2026-03+); btn-pagination = estructura antigua.
     function findPagBtns(root) {
         const btns = [];
         for (const el of root.querySelectorAll('*')) {
-            if (el.tagName === 'BUTTON' && el.classList.contains('btn-move')) btns.push(el);
+            if (el.tagName === 'BUTTON' &&
+                (el.classList.contains('btn-move') || el.classList.contains('btn-pagination')))
+                btns.push(el);
             if (el.shadowRoot) btns.push(...findPagBtns(el.shadowRoot));
         }
         return btns;
@@ -172,6 +180,9 @@ JS_NEXT_PAGE_RECT = """
     return null;
 }
 """
+
+DATE_RE = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+
 
 def _parse_monto(s: str) -> Optional[float]:
     """Convierte '$ -1.234' o '-$3.712.410' a float preservando el signo."""
@@ -227,6 +238,7 @@ class FalabellaScraper:
         self.periodo_facturacion: str = ""
         self.existing_keys: set = self._load_existing_keys()
         self.incomplete_keys: set = self._load_incomplete_keys()
+        self.pending_hashes: dict = {}  # {(desc_norm, monto_norm): tx_hash} — cargado antes de _reset_pending
 
         # Contadores de la ejecución actual
         self.run_id: Optional[int] = None
@@ -381,6 +393,28 @@ class FalabellaScraper:
             return incomplete
         except Exception:
             return set()
+
+    def _save_pending_hashes(self) -> dict:
+        """Guarda {(desc_norm, monto_norm): tx_hash} de todos los pendientes antes de borrarlos.
+        Permite migrar clasificaciones/splits cuando el tx_hash cambia al confirmarse."""
+        try:
+            cur = self.db_conn.cursor()
+            cur.execute(
+                "SELECT descripcion, monto, tx_hash FROM movimientos "
+                "WHERE pendiente = TRUE AND tx_hash IS NOT NULL"
+            )
+            rows = cur.fetchall()
+            cur.close()
+            mapping = {}
+            for row in rows:
+                desc = str(row["descripcion"] or "").rstrip("*").strip().upper()
+                monto = str(int(abs(float(row["monto"] or 0))))
+                mapping[(desc, monto)] = row["tx_hash"]
+            if mapping:
+                logger.info(f"Pendientes guardados para migración: {len(mapping)}")
+            return mapping
+        except Exception:
+            return {}
 
     def _reset_pending(self) -> None:
         """Elimina todos los pendientes de la DB al inicio del run para re-agregarlos frescos."""
@@ -544,6 +578,84 @@ class FalabellaScraper:
                     """,
                     params,
                 )
+
+            # Migrar clasificaciones y splits cuando pendiente → confirmado cambia la llave.
+            # Casos: (1) tx_hash cambia porque fecha_compra no estaba en el modal del pendiente;
+            #        (2) banco vuelve a estructura antigua y aparece codigo_autorizacion.
+            if not pendiente:
+                desc_norm = descripcion.rstrip("*").strip().upper()
+                monto_norm = str(int(abs(_parse_monto(monto_raw) or 0)))
+                # El hash real que tenía el pendiente en DB (puede diferir de potential_hash
+                # si fecha_compra no estaba disponible cuando se scrapeó como pendiente).
+                old_hash = self.pending_hashes.pop((desc_norm, monto_norm), None)
+                # Fallback: si no está en pending_hashes, usar potential_hash (cubre el caso en
+                # que el banco sirve auth code y potential_hash coincide con el pendiente).
+                if not old_hash and codigo_autorizacion and potential_hash:
+                    old_hash = potential_hash
+
+                if old_hash:
+                    if codigo_autorizacion:
+                        # tx_hash → codigo_autorizacion: migrar clasificación y splits
+                        cur.execute(
+                            """
+                            UPDATE clasificaciones
+                               SET codigo_autorizacion = %s, tx_hash = NULL, updated_at = NOW()
+                             WHERE tx_hash = %s
+                               AND NOT EXISTS (
+                                   SELECT 1 FROM clasificaciones WHERE codigo_autorizacion = %s
+                               )
+                            """,
+                            (codigo_autorizacion, old_hash, codigo_autorizacion),
+                        )
+                        migrated_cls = cur.rowcount
+                        cur.execute(
+                            """
+                            UPDATE splits
+                               SET codigo_autorizacion = %s, tx_hash = NULL
+                             WHERE tx_hash = %s
+                               AND NOT EXISTS (
+                                   SELECT 1 FROM splits WHERE codigo_autorizacion = %s
+                               )
+                            """,
+                            (codigo_autorizacion, old_hash, codigo_autorizacion),
+                        )
+                        migrated_spl = cur.rowcount
+                    elif tx_hash and old_hash != tx_hash:
+                        # tx_hash cambió (fecha_compra diferente entre pendiente y confirmado)
+                        cur.execute(
+                            """
+                            UPDATE clasificaciones
+                               SET tx_hash = %s, updated_at = NOW()
+                             WHERE tx_hash = %s
+                               AND NOT EXISTS (
+                                   SELECT 1 FROM clasificaciones WHERE tx_hash = %s
+                               )
+                            """,
+                            (tx_hash, old_hash, tx_hash),
+                        )
+                        migrated_cls = cur.rowcount
+                        cur.execute(
+                            """
+                            UPDATE splits
+                               SET tx_hash = %s
+                             WHERE tx_hash = %s
+                               AND NOT EXISTS (
+                                   SELECT 1 FROM splits WHERE tx_hash = %s
+                               )
+                            """,
+                            (tx_hash, old_hash, tx_hash),
+                        )
+                        migrated_spl = cur.rowcount
+                    else:
+                        migrated_cls = migrated_spl = 0
+
+                    if migrated_cls or migrated_spl:
+                        new_id = codigo_autorizacion or tx_hash
+                        logger.info(
+                            f"Migración pendiente→confirmado: {old_hash} → {new_id} "
+                            f"({migrated_cls} cls, {migrated_spl} splits) — {descripcion}"
+                        )
+
             self.db_conn.commit()
         except Exception:
             self.db_conn.rollback()
@@ -675,9 +787,13 @@ class FalabellaScraper:
             "num_cuotas": texts[4].strip() if len(texts) > 4 else "",
             "valor_cuota": texts[5].strip() if len(texts) > 5 else "",
         }
-        # Todos los movimientos (confirmados y pendientes) ahora aparecen en la misma tabla
-        # con fecha. La detección de pendiente se hace desde el modal (campo 'Cuotas').
-        return {"pendiente": False, "fecha": first, **base}
+        # Estructura nueva (2026-03+): todos los movimientos tienen fecha; pendiente se detecta
+        # desde el modal (campo 'Cuotas' ausente). Estructura antigua: pendientes sin fecha —
+        # DATE_RE lo marca pendiente=True aquí, confirmado en extract_all_movements via modal.
+        if DATE_RE.match(first):
+            return {"pendiente": False, "fecha": first, **base}
+        else:
+            return {"pendiente": True, "fecha": "", **base}
 
     # ------------------------------------------------------------------ #
     # Detalle                                                              #
@@ -717,8 +833,8 @@ class FalabellaScraper:
         except Exception:
             pass
 
-        # Esperar a que el modal tenga contenido real: buscamos 'Comercio' en el shadow DOM.
-        # El banco eliminó 'Código autorización' del modal — ya no se usa como señal de carga.
+        # Esperar a que el modal tenga contenido real.
+        # Acepta tanto estructura nueva ('Comercio') como antigua ('Código autorización').
         try:
             await page.wait_for_function(
                 """() => {
@@ -732,7 +848,7 @@ class FalabellaScraper:
                         }
                         return false;
                     }
-                    return hasLabel(document, 'Comercio');
+                    return hasLabel(document, 'Comercio') || hasLabel(document, 'Código autorización');
                 }""",
                 timeout=8000,
             )
@@ -843,8 +959,22 @@ class FalabellaScraper:
                     logger.info(f"  [{i+1}/{total_rows}] Incompleto, re-descargando — {movement.get('descripcion', '?')}")
 
                 detail = await self._open_and_read_detail(page, i)
-                # Pendiente = modal sin campo 'Cuotas' (confirmados siempre lo muestran)
-                movement["pendiente"] = not bool(detail.pop("modal_cuotas", None))
+                modal_cuotas = detail.pop("modal_cuotas", None)
+                has_auth = bool(detail.get("codigo_autorizacion"))
+                modal_loaded = bool(detail)  # True si el modal entregó algún campo útil
+                has_date = bool(DATE_RE.match(str(movement.get("fecha", "") or "")))
+
+                # Detección de pendiente según estructura activa:
+                # - Estructura antigua (has_auth): ambos pendientes Y confirmados tienen auth
+                #   code → el único discriminador es la fecha en la tabla (sin fecha = pendiente)
+                # - Estructura nueva (modal_loaded, sin auth): 'Cuotas' presente = confirmado
+                # - Fallback (modal no cargó): DATE_RE sobre fecha de tabla
+                if has_auth:
+                    movement["pendiente"] = not has_date
+                elif modal_loaded:
+                    movement["pendiente"] = not bool(modal_cuotas)
+                else:
+                    movement["pendiente"] = not has_date
                 movement.update(detail)
                 status = "pendiente" if movement["pendiente"] else "confirmado"
                 logger.info(
@@ -893,6 +1023,7 @@ class FalabellaScraper:
                 if not await self.navigate_to_movements(page):
                     self._finish_run("error", "Navegación a movimientos fallida")
                     return []
+                self.pending_hashes = self._save_pending_hashes()
                 self._reset_pending()
                 movements = await self.extract_all_movements(page)
                 self._finish_run("success")
