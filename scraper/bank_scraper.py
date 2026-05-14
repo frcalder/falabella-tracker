@@ -673,9 +673,23 @@ class FalabellaScraper:
 
     async def login(self, page: Page) -> bool:
         await page.goto("https://www.bancofalabella.cl/", wait_until="networkidle")
-        await page.click("//div[@id='main-header__sub-content']/div[3]/button[3]")
 
-        await page.wait_for_selector("input[placeholder='RUT']:visible", timeout=15000)
+        login_btn_xpath = "//div[@id='main-header__sub-content']/div[3]/button[3]"
+        try:
+            await page.wait_for_selector(login_btn_xpath, timeout=15000)
+            await page.click(login_btn_xpath)
+        except Exception:
+            await self._screenshot(page, "login_btn_not_found")
+            logger.error("No apareció el botón de ingreso en el header")
+            return False
+
+        try:
+            await page.wait_for_selector("input[placeholder='RUT']:visible", timeout=20000)
+        except Exception:
+            await self._screenshot(page, "login_rut_not_found")
+            logger.error("No apareció el campo RUT tras hacer click en Ingresar")
+            return False
+
         rut_field = page.locator("input[placeholder='RUT']:visible").first
         await rut_field.fill(self.username)
 
