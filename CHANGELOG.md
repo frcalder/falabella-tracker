@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-05-14
+
+### Fix: robustez del login en GitHub Actions — detección headless, popup Shadow DOM, exit code y diagnóstico
+
+**Síntoma:** El scraper en GitHub Actions fallaba con `Login fallido` o timeout en `networkidle`. Localmente funcionaba en modo normal pero no en headless. Los runs fallidos aparecían como "success" en Actions.
+
+**Causa raíz (múltiple):**
+1. `wait_until="networkidle"` nunca disparaba: el SPA del banco mantiene conexiones persistentes (polling/WebSocket) que impiden que la red quede idle.
+2. El banco detectaba Chromium en modo headless (via `navigator.webdriver` y la ausencia de UA real) y mostraba un popup de bloqueo: _"En estos momentos no lo podemos atender, por favor intenta más tarde"_ con botón "Entendido".
+3. El popup está dentro del Shadow DOM del banco — `page.locator()` no puede alcanzarlo; requiere JS con traversal recursivo de shadow roots.
+4. El click al botón de login se hacía sin esperar que el DOM de Angular terminara de renderizarlo.
+5. Los screenshots de diagnóstico solo se guardaban con `--debug`, que no se usa en Actions.
+6. El scraper terminaba con exit code 0 incluso en error → Actions marcaba el run como "success".
+
+**Fix (`scraper/bank_scraper.py`):**
+- `page.goto(..., wait_until="domcontentloaded")` en vez de `networkidle`.
+- `p.chromium.launch(args=["--disable-blink-features=AutomationControlled"])` + user-agent de Chrome real + `add_init_script` para anular `navigator.webdriver`.
+- `_dismiss_service_popup()`: usa `wait_for_function` + `page.evaluate()` con traversal recursivo de shadow roots para encontrar y clickear "Entendido". Se llama al cargar la página y tras enviar credenciales si "Hola" no aparece.
+- `wait_for_selector` en el botón de login antes de clickearlo.
+- `_screenshot(..., error=True)`: nuevo parámetro que guarda el screenshot siempre (sin `--debug`) en puntos de falla. Aplicado en todos los errores de login, carga de tabla y excepción inesperada en el run.
+- `_finish_run` guarda el status en `self._run_status`; `main()` llama `sys.exit(1)` si es `"error"`.
+
+**Fix (`.github/workflows/scraper.yml`):**
+- Paso `Upload debug screenshots` con `actions/upload-artifact@v4` y `if: always()` — los screenshots quedan disponibles en cada run de Actions para diagnóstico.
+
 ## 2026-05-13
 
 ### Fix: soporte dual-estructura UI banco + logging silenciado + migración de clasificaciones
