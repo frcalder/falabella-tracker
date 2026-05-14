@@ -4,6 +4,7 @@ El banco usa Shadow DOM — se traversa con JS para extraer datos y cerrar modal
 Paginación: botones ‹ 1 › (flechas SVG, no texto).
 """
 import os
+import sys
 import logging
 import asyncio
 import re
@@ -224,6 +225,7 @@ class FalabellaScraper:
         self.headless = headless
         self.debug_mode = debug_mode
         self.max_per_page: int = 0  # 0 = sin límite
+        self._run_status: str = "success"
 
         # Conexión a Supabase PostgreSQL
         self.db_conn = psycopg2.connect(
@@ -248,8 +250,7 @@ class FalabellaScraper:
         self._cnt_actualizados = 0
         self._cnt_pendientes = 0
 
-        if debug_mode:
-            (DEBUG_DIR / "screenshots").mkdir(parents=True, exist_ok=True)
+        (DEBUG_DIR / "screenshots").mkdir(parents=True, exist_ok=True)
 
     def __del__(self):
         try:
@@ -290,6 +291,7 @@ class FalabellaScraper:
 
     def _finish_run(self, status: str = "success", error: Optional[str] = None) -> None:
         """Actualiza el registro de la ejecución con los resultados finales."""
+        self._run_status = status
         if not self.run_id:
             return
         try:
@@ -663,30 +665,76 @@ class FalabellaScraper:
         finally:
             cur.close()
 
-    async def _screenshot(self, page: Page, name: str) -> None:
-        if self.debug_mode:
+    async def _screenshot(self, page: Page, name: str, *, error: bool = False) -> None:
+        if self.debug_mode or error:
             await page.screenshot(path=str(DEBUG_DIR / "screenshots" / f"{name}.png"))
+
+    async def _dismiss_service_popup(self, page: Page) -> None:
+        """Cierra el popup 'En estos momentos no lo podemos atender' si aparece.
+        El popup está dentro de Shadow DOM, requiere traversal con JS."""
+        JS_FIND_POPUP_BTN = """
+        () => {
+            function findButton(root) {
+                for (const el of root.querySelectorAll('*')) {
+                    if (el.tagName === 'BUTTON' &&
+                        el.textContent.trim() === 'Entendido') {
+                        return el;
+                    }
+                    if (el.shadowRoot) {
+                        const found = findButton(el.shadowRoot);
+                        if (found) return found;
+                    }
+                }
+                return null;
+            }
+            const btn = findButton(document);
+            if (btn) { btn.click(); return true; }
+            return false;
+        }
+        """
+        try:
+            await page.wait_for_function(
+                """() => {
+                    function find(root) {
+                        for (const el of root.querySelectorAll('*')) {
+                            if (el.tagName === 'BUTTON' &&
+                                el.textContent.trim() === 'Entendido') return true;
+                            if (el.shadowRoot && find(el.shadowRoot)) return true;
+                        }
+                        return false;
+                    }
+                    return find(document);
+                }""",
+                timeout=5000,
+            )
+            dismissed = await page.evaluate(JS_FIND_POPUP_BTN)
+            if dismissed:
+                logger.info("Popup de servicio no disponible cerrado")
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # Login                                                                #
     # ------------------------------------------------------------------ #
 
     async def login(self, page: Page) -> bool:
-        await page.goto("https://www.bancofalabella.cl/", wait_until="networkidle")
+        await page.goto("https://www.bancofalabella.cl/", wait_until="domcontentloaded")
+
+        await self._dismiss_service_popup(page)
 
         login_btn_xpath = "//div[@id='main-header__sub-content']/div[3]/button[3]"
         try:
             await page.wait_for_selector(login_btn_xpath, timeout=15000)
             await page.click(login_btn_xpath)
         except Exception:
-            await self._screenshot(page, "login_btn_not_found")
+            await self._screenshot(page, "login_btn_not_found", error=True)
             logger.error("No apareció el botón de ingreso en el header")
             return False
 
         try:
             await page.wait_for_selector("input[placeholder='RUT']:visible", timeout=20000)
         except Exception:
-            await self._screenshot(page, "login_rut_not_found")
+            await self._screenshot(page, "login_rut_not_found", error=True)
             logger.error("No apareció el campo RUT tras hacer click en Ingresar")
             return False
 
@@ -701,7 +749,7 @@ class FalabellaScraper:
             await submit.wait_for(state="visible", timeout=20000)
             await submit.click()
         except Exception:
-            await self._screenshot(page, "login_submit_failed")
+            await self._screenshot(page, "login_submit_failed", error=True)
             logger.error("No apareció el botón de login")
             return False
 
@@ -710,8 +758,15 @@ class FalabellaScraper:
             logger.info("Login exitoso")
             return True
         except Exception:
+            await self._dismiss_service_popup(page)
+            try:
+                await page.wait_for_selector("//span[normalize-space(text())='Hola']", timeout=10000)
+                logger.info("Login exitoso (tras cerrar popup)")
+                return True
+            except Exception:
+                pass
             logger.error("Login fallido")
-            await self._screenshot(page, "login_failed")
+            await self._screenshot(page, "login_failed", error=True)
             return False
 
     # ------------------------------------------------------------------ #
@@ -753,6 +808,7 @@ class FalabellaScraper:
                 logger.info(f"Período de facturación: {self.periodo_facturacion}")
             return True
         except Exception:
+            await self._screenshot(page, "movements_table_not_found", error=True)
             logger.error("No apareció la tabla")
             return False
 
@@ -1027,8 +1083,22 @@ class FalabellaScraper:
     async def run(self) -> List[Dict[str, Any]]:
         self._start_run()
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=self.headless)
-            context = await browser.new_context(viewport={"width": 1280, "height": 900}, locale="es-CL")
+            browser = await p.chromium.launch(
+                headless=self.headless,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                locale="es-CL",
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+            )
+            await context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            )
             page = await context.new_page()
             try:
                 if not await self.login(page):
@@ -1043,6 +1113,7 @@ class FalabellaScraper:
                 self._finish_run("success")
                 return movements
             except Exception as e:
+                await self._screenshot(page, "unexpected_error", error=True)
                 self._finish_run("error", str(e))
                 raise
             finally:
@@ -1054,6 +1125,9 @@ def main(debug_mode: bool = False, headless: bool = False, max_per_page: int = 0
     scraper = FalabellaScraper(headless=headless, debug_mode=debug_mode)
     scraper.max_per_page = max_per_page
     movements = asyncio.run(scraper.run())
+
+    if scraper._run_status == "error":
+        sys.exit(1)
 
     if movements:
         logger.info(f"{len(movements)} movimientos nuevos guardados en Supabase")

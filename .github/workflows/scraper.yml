@@ -6,27 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  check:
-    runs-on: ubuntu-latest
-    outputs:
-      configured: ${{ steps.check.outputs.configured }}
-    steps:
-      - id: check
-        env:
-          DB: ${{ secrets.DATABASE_URL }}
-          USER: ${{ secrets.FALABELLA_USER }}
-          PASS: ${{ secrets.FALABELLA_PASSWORD }}
-        run: |
-          if [ -n "$DB" ] && [ -n "$USER" ] && [ -n "$PASS" ]; then
-            echo "configured=true" >> $GITHUB_OUTPUT
-          else
-            echo "configured=false" >> $GITHUB_OUTPUT
-            echo "Secrets not configured — skipping. See README for setup instructions."
-          fi
-
   scrape:
-    needs: check
-    if: needs.check.outputs.configured == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,3 +27,11 @@ jobs:
           FALABELLA_PASSWORD: ${{ secrets.FALABELLA_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python main.py --mode scraper --headless
+
+      - name: Upload debug screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: debug/
+          if-no-files-found: ignore
