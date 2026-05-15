@@ -9,19 +9,38 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     steps:
+      - name: Check required secrets
+        id: check_secrets
+        run: |
+          if [ -z "$FALABELLA_USER" ] || [ -z "$FALABELLA_PASSWORD" ] || [ -z "$DATABASE_URL" ]; then
+            echo "configured=false" >> $GITHUB_OUTPUT
+            echo "Secrets not configured — skipping scraper run."
+          else
+            echo "configured=true" >> $GITHUB_OUTPUT
+          fi
+        env:
+          FALABELLA_USER: ${{ secrets.FALABELLA_USER }}
+          FALABELLA_PASSWORD: ${{ secrets.FALABELLA_PASSWORD }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
       - uses: actions/checkout@v4
+        if: steps.check_secrets.outputs.configured == 'true'
 
       - uses: actions/setup-python@v5
+        if: steps.check_secrets.outputs.configured == 'true'
         with:
           python-version: '3.11'
 
       - name: Install dependencies
+        if: steps.check_secrets.outputs.configured == 'true'
         run: pip install -r requirements.txt playwright
 
       - name: Install Playwright browsers
+        if: steps.check_secrets.outputs.configured == 'true'
         run: playwright install chromium --with-deps
 
       - name: Run scraper
+        if: steps.check_secrets.outputs.configured == 'true'
         env:
           FALABELLA_USER: ${{ secrets.FALABELLA_USER }}
           FALABELLA_PASSWORD: ${{ secrets.FALABELLA_PASSWORD }}
@@ -29,7 +48,7 @@ jobs:
         run: python main.py --mode scraper --headless
 
       - name: Upload debug screenshots
-        if: always()
+        if: steps.check_secrets.outputs.configured == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: debug-screenshots
