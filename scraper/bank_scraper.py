@@ -717,8 +717,18 @@ class FalabellaScraper:
     # Login                                                                #
     # ------------------------------------------------------------------ #
 
+    async def _login_with_retry(self, page: Page, max_attempts: int = 3) -> bool:
+        for attempt in range(1, max_attempts + 1):
+            if attempt > 1:
+                logger.info(f"Reintentando login (intento {attempt}/{max_attempts})...")
+                await page.wait_for_timeout(30000)
+            if await self.login(page):
+                return True
+        return False
+
     async def login(self, page: Page) -> bool:
         await page.goto("https://www.bancofalabella.cl/", wait_until="domcontentloaded")
+        await page.wait_for_timeout(1500)
 
         await self._dismiss_service_popup(page)
 
@@ -739,10 +749,12 @@ class FalabellaScraper:
             return False
 
         rut_field = page.locator("input[placeholder='RUT']:visible").first
-        await rut_field.fill(self.username)
+        await rut_field.click()
+        await rut_field.type(self.username, delay=80)
 
         pass_field = page.locator("input[placeholder='Clave Internet']:visible").first
-        await pass_field.fill(self.password)
+        await pass_field.click()
+        await pass_field.type(self.password, delay=80)
 
         try:
             submit = page.locator("button#desktop-login:not([disabled])")
@@ -1101,8 +1113,8 @@ class FalabellaScraper:
             )
             page = await context.new_page()
             try:
-                if not await self.login(page):
-                    self._finish_run("error", "Login fallido")
+                if not await self._login_with_retry(page):
+                    self._finish_run("error", "Login fallido tras 3 intentos")
                     return []
                 if not await self.navigate_to_movements(page):
                     self._finish_run("error", "Navegación a movimientos fallida")

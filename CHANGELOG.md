@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-05-25
+
+### Fix: reintentos automáticos de login + escritura humana de credenciales
+
+**Síntoma:** El scraper fallaba ~3 de cada 10 runs en GitHub Actions con "Login fallido". El patrón en los logs muestra el popup "En estos momentos no lo podemos atender" **dos veces**: una al cargar la página (normal, ya manejada) y otra 20 segundos después, coincidiendo exactamente con el timeout de `wait_for_selector("Hola", 20000)`.
+
+**Causa raíz:** El banco detecta la automatización durante el envío de credenciales y muestra el popup de "servicio no disponible" a nivel de respuesta del backend. Descartar el popup no rescata la sesión ya rechazada. El bloqueo es intermitente (probabilístico) — algunos días bloquea todo el día (23/05), otros días funciona sin problemas.
+
+**Fix (`scraper/bank_scraper.py`):**
+- `_login_with_retry()`: wrapper que reintenta `login()` hasta 3 veces con 30s de espera entre intentos. Cada intento recarga la página desde cero (`page.goto()` al inicio de `login()`).
+- `page.wait_for_timeout(1500)` tras `domcontentloaded`: pequeña espera para que Angular termine de renderizar el header antes del popup check.
+- `rut_field.type(username, delay=80)` / `pass_field.type(password, delay=80)` en vez de `fill()`: genera key events por carácter (~80ms entre teclas) imitando escritura humana, reduciendo la señal de automatización.
+- `run()` usa `_login_with_retry()` en vez de `login()` directamente; mensaje de error actualizado a "Login fallido tras 3 intentos".
+
+**Limitación conocida:** Si el banco bloquea el IP de GitHub Actions durante todo el día (como ocurrió el 23/05), los 3 reintentos tampoco alcanzan. En ese caso la solución definitiva es correr desde un IP fijo o variar el horario del cron.
+
 ## 2026-05-14
 
 ### Fix: robustez del login en GitHub Actions — detección headless, popup Shadow DOM, exit code y diagnóstico
