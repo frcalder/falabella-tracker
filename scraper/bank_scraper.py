@@ -398,7 +398,9 @@ class FalabellaScraper:
 
     def _load_incomplete_keys(self) -> set:
         """Claves de filas confirmadas que faltan rubro o comercio del modal.
-        El banco eliminó 'Código autorización' del modal — ya no se reintenta por auth."""
+        No se reintenta por `codigo_autorizacion IS NULL`: las filas del bache de
+        abril–mayo 2026 (cuando el banco no servía el campo) nunca podrán obtenerlo,
+        así que se re-procesarían en cada run sin resultado."""
         try:
             cur = self.db_conn.cursor()
             cur.execute(
@@ -406,8 +408,8 @@ class FalabellaScraper:
                 SELECT fecha, descripcion, monto, num_cuotas FROM movimientos
                 WHERE pendiente = FALSE
                   AND (
-                    -- El banco eliminó 'Código autorización' del modal: ya no se reintenta por auth.
-                    -- Solo se reintenta si falta rubro o comercio (campos que sí siguen en el modal).
+                    -- Solo se reintenta si falta rubro o comercio (ver docstring: reintentar
+                    -- por auth NULL re-procesaría para siempre las filas del bache abr–may 2026).
                     rubro IS NULL OR rubro = '' OR comercio IS NULL OR comercio = ''
                   )
                 """

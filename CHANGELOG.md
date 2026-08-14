@@ -18,6 +18,26 @@
 
 **Limpieza de datos:** no se requiere — los runs fallaron antes de escribir en la base.
 
+### Doc: el banco volvió a servir `Código autorización`, `Pais` y `Origen de la compra`
+
+`CLAUDE.md` decía que estos tres campos quedaron eliminados del modal en ~2026-03 y son "always NULL". Es falso: el bache fue **abril 2026** y el banco los volvió a servir **~2026-05-08**. Cobertura de `codigo_autorizacion` medida en una cuenta real, por mes de transacción: 04/2026 33/87, 05/2026 57/89, 06/2026 86/90, 07/2026 79/85, 08/2026 42/43 (~95% desde junio). El código nunca dejó de extraerlos (`JS_EXTRACT_FIELDS.LABELS` los mantiene), así que solo la documentación estaba desfasada.
+
+- `CLAUDE.md`: corregidas las notas de las tres columnas; la sección **Installment uniqueness** ahora describe los dos caminos (auth code / `tx_hash`) como **estado permanente**, no como una migración en curso, e indica cuál aplica (pendientes siempre por hash, más ~4–6 confirmados por período sin auth). Agregada la sección **Pendiente → confirmado key migration**, que documenta que `_save_movement` migra `clasificaciones` y `splits` de `tx_hash` a `codigo_autorizacion` en la misma transacción — la clasificación de un pendiente sobrevive a la confirmación.
+- `scraper/bank_scraper.py`: corregido el comentario y docstring de `_load_incomplete_keys`, que justificaban no reintentar por `codigo_autorizacion IS NULL` con una premisa ya falsa. El comportamiento **no cambia**: el motivo real es que las filas del bache abr–may nunca podrán obtener auth code y se re-procesarían en cada run.
+
+**Limpieza de datos:** no se requiere para este cambio. Si vienes del bache abr–may 2026 puedes tener clasificaciones huérfanas (creadas por `tx_hash` o por un `codigo_autorizacion` que ya no existe en `movimientos`). Para revisarlas:
+
+```sql
+-- clasificaciones que no enlazan con ningún movimiento
+SELECT * FROM clasificaciones c
+ WHERE (c.tx_hash IS NOT NULL AND NOT EXISTS (
+         SELECT 1 FROM movimientos m WHERE m.tx_hash = c.tx_hash))
+    OR (c.codigo_autorizacion IS NOT NULL AND NOT EXISTS (
+         SELECT 1 FROM movimientos m WHERE m.codigo_autorizacion = c.codigo_autorizacion));
+```
+
+Revisa el SELECT antes de borrar: una huérfana por `tx_hash` puede ser el duplicado benigno de una clasificación que ya migró a `codigo_autorizacion`, y borrarla no pierde información, pero las demás implican re-clasificar el movimiento a mano.
+
 ## 2026-05-25
 
 ### Fix: reintentos automáticos de login + escritura humana de credenciales

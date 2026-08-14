@@ -62,9 +62,12 @@ Data is stored in **Supabase PostgreSQL**. The scraper runs daily via **GitHub A
 - Con `codigo_autorizacion`: `NULL` — auth code is the real identifier; hash is redundant
 - Sin `codigo_autorizacion` (pendientes y confirmadas): `sha256(fecha_compra|descripcion|monto)[:16]` — permite clasificar pendientes y que la clasificación persista cuando se confirman (mismo hash, mismos inputs)
 
-**Installment uniqueness**: Two paths depending on whether the bank provides `codigo_autorizacion`:
+**Installment uniqueness**: Two paths depending on whether the bank provides `codigo_autorizacion`. **Both are live** — the scraper always extracts the auth code when present and falls back to the hash when it isn't; this is the steady state, not a migration in progress:
 - With auth code: `UNIQUE (codigo_autorizacion, num_cuotas)` — one row per installment. Upsert uses `ON CONFLICT (codigo_autorizacion, num_cuotas)`. Migration: `analytics/migrations/002_cuotas_unique.sql`.
-- Without auth code (current bank behavior since ~2026-03): `tx_hash = sha256(fecha_compra|descripcion|monto)` per purchase. Uniqueness via partial index `(tx_hash, periodo) WHERE tx_hash IS NOT NULL` — within a period there is exactly one cuota per purchase. Upsert uses `ON CONFLICT (tx_hash, periodo)`. Migration: `analytics/migrations/005_tx_hash_cuotas_unique.sql`.
+- Without auth code: `tx_hash = sha256(fecha_compra|descripcion|monto)` per purchase. Uniqueness via partial index `(tx_hash, periodo) WHERE tx_hash IS NOT NULL` — within a period there is exactly one cuota per purchase. Upsert uses `ON CONFLICT (tx_hash, periodo)`. Migration: `analytics/migrations/005_tx_hash_cuotas_unique.sql`.
+- **Which path applies**: pendientes always take the hash path (the modal has no auth code until the movement is confirmed), plus ~4–6 confirmed rows per period whose modal didn't serve the field. Everything else takes the auth path. The bank stopped serving the auth code in April 2026 and resumed ~2026-05-08; coverage has been ~95% since June 2026. Assume either path can apply to any given row.
+
+**Pendiente → confirmado key migration**: when a pendiente (classified by `tx_hash`) is confirmed and the bank now serves an auth code, the row's `tx_hash` becomes NULL and its identity moves to `codigo_autorizacion`. `_save_movement` migrates `clasificaciones` and `splits` to the new key in the same transaction (see the block after the upsert), so classifications survive the switch. The same block covers the case where `tx_hash` itself changes because `fecha_compra` wasn't available on the pendiente.
 
 **Pagination**: `_go_next_page` uses `wait_for_function` to detect when the first row text changes after clicking next, avoiding false loop detection when all rows are skipped.
 
@@ -107,11 +110,11 @@ Split key is `codigo_autorizacion` alone (same as `clasificaciones`) — a split
 | `pendiente` | TRUE if unconfirmed |
 | `rubro` | Category from bank modal |
 | `comercio` | Merchant name from modal |
-| `codigo_autorizacion` | Auth code — part of composite unique key `(codigo_autorizacion, num_cuotas)`. Bank stopped serving this field ~2026-03; always NULL for new transactions. |
+| `codigo_autorizacion` | Auth code — part of composite unique key `(codigo_autorizacion, num_cuotas)`. The bank stopped serving it in April 2026 and resumed ~2026-05-08; ~95% of rows have it since June 2026. NULL for pendientes and for the few confirmed rows whose modal didn't serve it (those use `tx_hash`). |
 | `fecha_compra` | Purchase date from modal (may differ from `fecha`) |
 | `hora` | Purchase time from modal |
-| `pais` | Country — bank stopped serving this field ~2026-03; always NULL |
-| `origen` | Purchase origin type — bank stopped serving this field ~2026-03; always NULL |
+| `pais` | Country from modal — missing during the April–early May 2026 gap, served again since then |
+| `origen` | Purchase origin type from modal — missing during the April–early May 2026 gap, served again since then |
 | `periodo_facturacion` | "DD/MM/YYYY" closing date of billing cycle |
 | `periodo` | "YYYY-MM" derived from `periodo_facturacion` |
 | `num_cuotas` | Number of installments |
