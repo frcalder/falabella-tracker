@@ -50,9 +50,12 @@ Data is stored in **Supabase PostgreSQL**. The scraper runs daily via **GitHub A
 - `JS_CLOSE_MODAL` — traverses shadow roots looking for a × button, falls back to backdrop click.
 - `JS_NEXT_PAGE_RECT` — finds all `btn-move` class buttons (SVG only, no text), returns bounding rect of the last one (next›). Returns `null` if that button is disabled (last page).
 
-**Single table**: All movements (pending and confirmed) appear in one table with dates. Pending movements have no value in the cuotas column (`/`). `_read_row` always returns `pendiente=False`; the real signal comes from the modal (`modal_cuotas` absent = pending).
+**Single table**: All movements (pending and confirmed) appear in one table. `_read_row` always returns `pendiente=False`; the real signal is decided in `extract_all_movements` and depends on which structure the bank is currently serving (the scraper handles all three):
+- Auth code present in the modal (**current behavior**, and the pre-April-2026 one): both pendientes and confirmados carry an auth code, so the discriminator is the table's `fecha` column — **no date = pendiente**. Pendientes do carry a cuotas value (`01/01`) in this structure.
+- Auth code absent but modal loaded (April–early May 2026): `modal_cuotas` present = confirmed, absent = pendiente. Pendientes have no value in the cuotas column (`/`) and the table does show a date.
+- Modal didn't load: fallback to `DATE_RE` over the table's date.
 
-**Checkpoint / resume**: `existing_keys` (loaded from DB at init) tracks processed confirmed movements. Key format: `(fecha, descripcion, abs(monto_int), num_cuotas)` — derived from table columns, available before opening the modal. `num_cuotas` differentiates installments of the same purchase (e.g. cuota 01/03 vs 02/03). The skip check only applies to confirmed movements (`num_cuotas` truthy) — pending have no cuota value and are always re-processed. Monto is normalized to int for comparison between raw cell text and DB Decimal.
+**Checkpoint / resume**: `existing_keys` (loaded from DB at init) tracks processed confirmed movements. Key format: `(fecha, descripcion, abs(monto_int), num_cuotas)` — derived from table columns, available before opening the modal. `num_cuotas` differentiates installments of the same purchase (e.g. cuota 01/03 vs 02/03). The skip check only applies to rows with a `num_cuotas` value; in the structure where pendientes have no cuota value, that alone re-processes them. When pendientes *do* carry a cuota value (current structure), they are still re-processed every run because `_load_existing_keys` only loads `pendiente = FALSE` rows, so a pendiente's key is never in `existing_keys`. Monto is normalized to int for comparison between raw cell text and DB Decimal.
 
 `incomplete_keys` holds confirmed rows missing `rubro` or `comercio`. If a movement's key is in `incomplete_keys`, it is re-processed even if already in `existing_keys`, allowing a later scraper run to fill in modal data that failed previously.
 
@@ -60,14 +63,14 @@ Data is stored in **Supabase PostgreSQL**. The scraper runs daily via **GitHub A
 
 **tx_hash**:
 - Con `codigo_autorizacion`: `NULL` — auth code is the real identifier; hash is redundant
-- Sin `codigo_autorizacion` (pendientes y confirmadas): `sha256(fecha_compra|descripcion|monto)[:16]` — permite clasificar pendientes y que la clasificación persista cuando se confirman (mismo hash, mismos inputs)
+- Sin `codigo_autorizacion` (pendientes o confirmadas, según lo que sirva el banco): `sha256(fecha_compra|descripcion|monto)[:16]` — permite clasificar pendientes y que la clasificación persista cuando se confirman (mismo hash, mismos inputs)
 
 **Installment uniqueness**: Two paths depending on whether the bank provides `codigo_autorizacion`. **Both are live** — the scraper always extracts the auth code when present and falls back to the hash when it isn't; this is the steady state, not a migration in progress:
 - With auth code: `UNIQUE (codigo_autorizacion, num_cuotas)` — one row per installment. Upsert uses `ON CONFLICT (codigo_autorizacion, num_cuotas)`. Migration: `analytics/migrations/002_cuotas_unique.sql`.
 - Without auth code: `tx_hash = sha256(fecha_compra|descripcion|monto)` per purchase. Uniqueness via partial index `(tx_hash, periodo) WHERE tx_hash IS NOT NULL` — within a period there is exactly one cuota per purchase. Upsert uses `ON CONFLICT (tx_hash, periodo)`. Migration: `analytics/migrations/005_tx_hash_cuotas_unique.sql`.
-- **Which path applies**: pendientes always take the hash path (the modal has no auth code until the movement is confirmed), plus ~4–6 confirmed rows per period whose modal didn't serve the field. Everything else takes the auth path. The bank stopped serving the auth code in April 2026 and resumed ~2026-05-08; coverage has been ~95% since June 2026. Assume either path can apply to any given row.
+- **Which path applies**: whatever the modal served for that row — **pendientes included**. Since the auth code came back (~2026-05-08) most pendientes arrive with one and take the auth path directly (`tx_hash` NULL); the hash path covers rows whose modal had no auth code: everything scraped during the April–early May 2026 gap, plus the ~4–6 confirmed rows per period where the field is still missing. Coverage has been ~95% since June 2026. Assume either path can apply to any given row, pendiente or not.
 
-**Pendiente → confirmado key migration**: when a pendiente (classified by `tx_hash`) is confirmed and the bank now serves an auth code, the row's `tx_hash` becomes NULL and its identity moves to `codigo_autorizacion`. `_save_movement` migrates `clasificaciones` and `splits` to the new key in the same transaction (see the block after the upsert), so classifications survive the switch. The same block covers the case where `tx_hash` itself changes because `fecha_compra` wasn't available on the pendiente.
+**Pendiente → confirmado key migration**: relevant only for pendientes stored **without** an auth code (i.e. keyed by `tx_hash`). If such a pendiente is confirmed and the modal now serves an auth code, the row's `tx_hash` becomes NULL and its identity moves to `codigo_autorizacion`. A pendiente that already had an auth code keeps the same key when confirmed, so nothing needs migrating. `_save_movement` migrates `clasificaciones` and `splits` to the new key in the same transaction (see the block after the upsert), so classifications survive the switch. The same block covers the case where `tx_hash` itself changes because `fecha_compra` wasn't available on the pendiente.
 
 **Pagination**: `_go_next_page` uses `wait_for_function` to detect when the first row text changes after clicking next, avoiding false loop detection when all rows are skipped.
 
@@ -110,7 +113,7 @@ Split key is `codigo_autorizacion` alone (same as `clasificaciones`) — a split
 | `pendiente` | TRUE if unconfirmed |
 | `rubro` | Category from bank modal |
 | `comercio` | Merchant name from modal |
-| `codigo_autorizacion` | Auth code — part of composite unique key `(codigo_autorizacion, num_cuotas)`. The bank stopped serving it in April 2026 and resumed ~2026-05-08; ~95% of rows have it since June 2026. NULL for pendientes and for the few confirmed rows whose modal didn't serve it (those use `tx_hash`). |
+| `codigo_autorizacion` | Auth code — part of composite unique key `(codigo_autorizacion, num_cuotas)`. The bank stopped serving it in April 2026 and resumed ~2026-05-08; ~95% of rows have it since June 2026. NULL only for rows whose modal didn't serve it — those use `tx_hash`. Pendientes normally do have an auth code now. |
 | `fecha_compra` | Purchase date from modal (may differ from `fecha`) |
 | `hora` | Purchase time from modal |
 | `pais` | Country from modal — missing during the April–early May 2026 gap, served again since then |
