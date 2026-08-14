@@ -65,6 +65,40 @@ JS_CLOSE_MODAL = """
 }
 """
 
+JS_HAS_BLOCKING_BACKDROP = """
+() => {
+    const els = Array.from(document.querySelectorAll('div.backdrop, .cdk-overlay-backdrop'));
+    return els.some(el => {
+        const r = el.getBoundingClientRect();
+        const s = getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' &&
+               s.display !== 'none' && s.opacity !== '0';
+    });
+}
+"""
+
+# Cierra el modal promocional buscando su botón ×. Nunca clickea 'Acepto': ese botón
+# inscribe al usuario en el programa CMR Puntos y autoriza comunicaciones comerciales.
+JS_CLICK_PROMO_CLOSE = """
+() => {
+    for (const b of Array.from(document.querySelectorAll('button'))) {
+        const cls = (b.className || '').toString().toLowerCase();
+        const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+        const text = (b.textContent || '').trim();
+        const isClose = cls.includes('close') || ['close','cerrar','dismiss'].includes(aria) ||
+                        ['×','✕','✖','x'].includes(text) ||
+                        !!b.querySelector('svg.icon-close, use[*|href$="#icon-close"]');
+        if (!isClose) continue;
+        if (/cerrar sesi/i.test(aria) || /cerrar sesi/i.test(text)) continue;  // no cerrar sesión
+        const r = b.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) continue;
+        b.click();
+        return cls || aria || text || 'close';
+    }
+    return null;
+}
+"""
+
 JS_EXTRACT_FIELDS = """
 () => {
     const LABELS = {
@@ -713,6 +747,54 @@ class FalabellaScraper:
         except Exception:
             pass
 
+    async def _dismiss_blocking_modals(self, page: Page, attempts: int = 3) -> bool:
+        """Cierra los modales post-login que dejan un backdrop interceptando los clics.
+
+        Desde 2026-08-12 el banco muestra `app-popup-terms-conditions-optin` (opt-in de
+        CMR Puntos): su `div.backdrop` (z-index 1000) bloquea el click en la tarjeta y
+        cualquier click posterior. Se cierra con la × (`button.close-misdocumentos`),
+        nunca con 'Acepto' — eso inscribiría al usuario en el programa.
+
+        Devuelve True si no queda ningún backdrop bloqueando.
+        """
+        CLOSE_SELECTORS = [
+            "#optin button.close-misdocumentos",
+            "app-popup-terms-conditions-optin button[class*='close']",
+            "app-marketing button",
+        ]
+
+        # El modal puede tardar en montarse tras el login.
+        try:
+            await page.wait_for_function(JS_HAS_BLOCKING_BACKDROP, timeout=5000)
+        except Exception:
+            return True  # nunca apareció
+
+        for _ in range(attempts):
+            if not await page.evaluate(JS_HAS_BLOCKING_BACKDROP):
+                return True
+
+            closed = None
+            for sel in CLOSE_SELECTORS:
+                try:
+                    await page.locator(sel).first.click(timeout=2000)
+                    closed = sel
+                    break
+                except Exception:
+                    continue
+            if not closed:
+                closed = await page.evaluate(JS_CLICK_PROMO_CLOSE)
+            if closed:
+                logger.info(f"Modal bloqueante cerrado ({closed})")
+            else:
+                await page.keyboard.press("Escape")
+            await page.wait_for_timeout(1200)  # animación de cierre
+
+        if await page.evaluate(JS_HAS_BLOCKING_BACKDROP):
+            logger.warning("El backdrop sigue visible tras intentar cerrar los modales")
+            await self._screenshot(page, "backdrop_bloqueado", error=True)
+            return False
+        return True
+
     # ------------------------------------------------------------------ #
     # Login                                                                #
     # ------------------------------------------------------------------ #
@@ -787,16 +869,7 @@ class FalabellaScraper:
 
     async def navigate_to_movements(self, page: Page) -> bool:
 
-        try:
-            backdrop = page.locator("#background-shadow.backdrop.visible")
-            await backdrop.wait_for(state="visible", timeout=5000)
-            try:
-                await page.locator("app-marketing button").first.click(timeout=3000)
-            except Exception:
-                await backdrop.click(force=True)
-            await backdrop.wait_for(state="hidden", timeout=5000)
-        except Exception:
-            pass
+        await self._dismiss_blocking_modals(page)
 
         card_link = page.locator(
             "a.div-product",
@@ -809,7 +882,17 @@ class FalabellaScraper:
             card_link = page.locator("a.div-product").first
             await card_link.wait_for(state="visible", timeout=10000)
 
-        await card_link.click()
+        try:
+            await card_link.click(timeout=15000)
+        except Exception:
+            # Un modal apareció después del dismiss: cerrar y reintentar.
+            logger.warning("Click en la tarjeta bloqueado — cerrando modales y reintentando")
+            await self._dismiss_blocking_modals(page)
+            try:
+                await card_link.click(timeout=10000)
+            except Exception:
+                logger.warning("Click bloqueado de nuevo — usando click directo en el DOM")
+                await card_link.evaluate("el => el.click()")
 
         try:
             await page.wait_for_selector(self.ROW_SELECTOR, timeout=30000)

@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-08-14
+
+### Fix: modal de opt-in CMR Puntos bloqueaba el click en la tarjeta
+
+**Síntoma:** El scraper falló en GitHub Actions los días 12, 13 y 14 de agosto de 2026 con `TimeoutError: Locator.click: Timeout 30000ms exceeded` sobre `a.div-product` (tarjeta CMR Mastercard). El call log de Playwright repetía: `<div class="backdrop"> ... subtree intercepts pointer events`. El screenshot de debug mostró un modal nuevo: _"¡Pronto podrás acumular más CMR puntos!"_.
+
+**Causa raíz:** El banco agregó un modal de opt-in tras el login — componente Angular `app-popup-terms-conditions-optin#optin`, con `div.backdrop` (z-index 1000) a pantalla completa. El manejo de backdrop existente sólo cubría el modal de marketing antiguo (`#background-shadow.backdrop.visible` + `app-marketing button`), así que el backdrop nuevo nunca se cerraba e interceptaba todos los clicks.
+
+**Fix (`scraper/bank_scraper.py`):**
+- `_dismiss_blocking_modals()`: reemplaza el bloque específico de `#background-shadow`. Espera hasta 5s a que aparezca cualquier backdrop bloqueante (`JS_HAS_BLOCKING_BACKDROP` verifica visibilidad real de `div.backdrop, .cdk-overlay-backdrop`), lo cierra y **verifica que desapareció**, hasta 3 intentos. Si queda bloqueado, guarda screenshot `backdrop_bloqueado.png`.
+- Selectores de cierre en orden: `#optin button.close-misdocumentos` → `app-popup-terms-conditions-optin button[class*='close']` → `app-marketing button` → fallback JS `JS_CLICK_PROMO_CLOSE` (busca botones de cierre por clase/aria/`svg.icon-close`) → Escape.
+- **El modal se cierra siempre con la ×, nunca con "Acepto"**: ese botón inscribe al usuario en el programa CMR Puntos y autoriza comunicaciones comerciales. `JS_CLICK_PROMO_CLOSE` sólo matchea botones de cierre y excluye explícitamente "Cerrar sesión".
+- Click en la tarjeta con reintento: si falla, vuelve a cerrar modales y reintenta; como último recurso `card_link.evaluate("el => el.click()")` (click directo en el DOM, ignora el overlay).
+
+**Verificado:** `pipenv run python main.py --mode scraper --limit 1 --headless --debug` → `Modal bloqueante cerrado (#optin button.close-misdocumentos)`, tabla cargada, 5 páginas recorridas.
+
+**Limpieza de datos:** no se requiere — los runs fallaron antes de escribir en la base.
+
 ## 2026-05-25
 
 ### Fix: reintentos automáticos de login + escritura humana de credenciales
