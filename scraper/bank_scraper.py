@@ -707,13 +707,29 @@ class FalabellaScraper:
 
     async def _dismiss_service_popup(self, page: Page) -> None:
         """Cierra el popup 'En estos momentos no lo podemos atender' si aparece.
-        El popup está dentro de Shadow DOM, requiere traversal con JS."""
-        JS_FIND_POPUP_BTN = """
-        () => {
+        El popup está dentro de Shadow DOM, requiere traversal con JS.
+
+        El botón se busca por texto ('Entendido') **y** por contexto: el sitio público
+        tiene otros dos 'Entendido' (el aviso de cookies y `#btn-login-client-nuevo`,
+        dentro del drawer de login) que no deben clickearse.
+        """
+        JS_POPUP = """
+        (mode) => {
+            const NEEDLE = 'no lo podemos atender';
+            function inServicePopup(el) {
+                let n = el;
+                for (let i = 0; i < 8 && n && n.tagName !== 'BODY'; i++) {
+                    if ((n.textContent || '').toLowerCase().includes(NEEDLE)) return true;
+                    const root = n.getRootNode();
+                    n = n.parentElement || (root && root.host) || null;
+                }
+                return false;
+            }
             function findButton(root) {
                 for (const el of root.querySelectorAll('*')) {
                     if (el.tagName === 'BUTTON' &&
-                        el.textContent.trim() === 'Entendido') {
+                        el.textContent.trim() === 'Entendido' &&
+                        inServicePopup(el)) {
                         return el;
                     }
                     if (el.shadowRoot) {
@@ -724,26 +740,14 @@ class FalabellaScraper:
                 return null;
             }
             const btn = findButton(document);
-            if (btn) { btn.click(); return true; }
-            return false;
+            if (!btn) return false;
+            if (mode === 'click') btn.click();
+            return true;
         }
         """
         try:
-            await page.wait_for_function(
-                """() => {
-                    function find(root) {
-                        for (const el of root.querySelectorAll('*')) {
-                            if (el.tagName === 'BUTTON' &&
-                                el.textContent.trim() === 'Entendido') return true;
-                            if (el.shadowRoot && find(el.shadowRoot)) return true;
-                        }
-                        return false;
-                    }
-                    return find(document);
-                }""",
-                timeout=5000,
-            )
-            dismissed = await page.evaluate(JS_FIND_POPUP_BTN)
+            await page.wait_for_function(JS_POPUP, arg="probe", timeout=5000)
+            dismissed = await page.evaluate(JS_POPUP, "click")
             if dismissed:
                 logger.info("Popup de servicio no disponible cerrado")
         except Exception:
@@ -816,37 +820,55 @@ class FalabellaScraper:
 
         await self._dismiss_service_popup(page)
 
-        login_btn_xpath = "//div[@id='main-header__sub-content']/div[3]/button[3]"
+        # Desde 2026-08-18 el sitio público es un Next.js: el header ya no tiene
+        # `#main-header__sub-content` y el formulario vive en un drawer que monta sus
+        # inputs solo al clickear "Mi Cuenta". Las clases son CSS-modules con hash
+        # (cambian en cada deploy), así que solo se usan anclas estables: el id
+        # `#main-header`, el texto del botón y los ids `#document` / `#pass`.
+        login_btn = page.locator("#main-header button:visible", has_text="Mi Cuenta").first
         try:
-            await page.wait_for_selector(login_btn_xpath, timeout=15000)
-            await page.click(login_btn_xpath)
+            await login_btn.wait_for(state="visible", timeout=20000)
         except Exception:
             await self._screenshot(page, "login_btn_not_found", error=True)
-            logger.error("No apareció el botón de ingreso en el header")
+            logger.error("No apareció el botón 'Mi Cuenta' en el header")
             return False
 
-        try:
-            await page.wait_for_selector("input[placeholder='RUT']:visible", timeout=20000)
-        except Exception:
+        rut_field = page.locator("#document:visible").first
+        for attempt in (1, 2):
+            if await rut_field.is_visible():
+                break
+            await login_btn.click()
+            try:
+                await rut_field.wait_for(state="visible", timeout=6000)
+                break
+            except Exception:
+                # Next.js hidrata el header después del SSR: el primer click puede caer
+                # antes de que el handler esté montado.
+                logger.info(f"El drawer de login no abrió (intento {attempt}/2)")
+                await page.wait_for_timeout(1500)
+
+        if not await rut_field.is_visible():
             await self._screenshot(page, "login_rut_not_found", error=True)
-            logger.error("No apareció el campo RUT tras hacer click en Ingresar")
+            logger.error("No apareció el campo RUT tras hacer click en 'Mi Cuenta'")
             return False
 
-        rut_field = page.locator("input[placeholder='RUT']:visible").first
+        # El campo formatea el RUT solo y tiene maxlength=10: hay que escribirlo sin puntos.
         await rut_field.click()
-        await rut_field.type(self.username, delay=80)
+        await rut_field.type(self.username.replace(".", "").strip(), delay=80)
 
-        pass_field = page.locator("input[placeholder='Clave Internet']:visible").first
+        pass_field = page.locator("#pass:visible").first
         await pass_field.click()
         await pass_field.type(self.password, delay=80)
 
         try:
-            submit = page.locator("button#desktop-login:not([disabled])")
+            # El submit del drawer se habilita cuando ambos campos son válidos. Se ancla
+            # al form que contiene #pass para no depender de las clases con hash.
+            submit = page.locator("form:has(#pass) button[type='submit']:not([disabled])")
             await submit.wait_for(state="visible", timeout=20000)
             await submit.click()
         except Exception:
             await self._screenshot(page, "login_submit_failed", error=True)
-            logger.error("No apareció el botón de login")
+            logger.error("No apareció el botón de login habilitado")
             return False
 
         try:

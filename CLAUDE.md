@@ -39,6 +39,8 @@ For local Streamlit secrets (GITHUB_TOKEN): `.streamlit/secrets.toml`.
 
 The bank's frontend is an Angular SPA with **Shadow DOM** — standard CSS selectors and Playwright locators don't reach inside components. All DOM interaction (modal extraction, pagination buttons, close button) is done via `page.evaluate()` with custom JS that traverses shadow roots recursively.
 
+There are **two different frontends**. The **private area** (post-login: card list, movements table, detail modals) is the Angular + Shadow DOM app described above. The **public site** (home page, where login happens) was rebuilt as a **Next.js app on 2026-08-18** — no Shadow DOM there, but its class names are CSS-modules with a per-build hash (`MiddleNav_buttonPrimary__09N_a`), so they are unusable as selectors. `login()` therefore anchors only to things that survive a deploy: the `#main-header` id, the "Mi Cuenta" button text, and the `#document` / `#pass` input ids. The login form lives in a drawer that mounts its inputs only after clicking "Mi Cuenta", and the header is server-rendered before hydration — so a first click can land before the handler exists, hence the single re-click.
+
 Data is stored in **Supabase PostgreSQL**. The scraper runs daily via **GitHub Actions** and can also be triggered manually from the Streamlit dashboard.
 
 ### Key design decisions

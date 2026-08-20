@@ -1,5 +1,44 @@
 # Changelog
 
+## 2026-08-20
+
+### Fix: el sitio público migró a Next.js y el login del scraper quedó roto
+
+**Síntoma:** El scraper falla en el login, agotando los 3 intentos, con `No apareció el botón de ingreso en el header`. En GitHub Actions el job sale con exit code 1 y el screenshot `login_btn_not_found.png` muestra la home **cargada correctamente** — no es una caída del banco. Primera corrida afectada: 2026-08-18.
+
+**Causa raíz:** El banco reconstruyó el sitio público como una app **Next.js**. Los cuatro anclajes del login desaparecieron:
+
+| Antes | Ahora |
+|---|---|
+| `//div[@id='main-header__sub-content']/div[3]/button[3]` | El id `main-header__sub-content` ya no existe; el botón es `Mi Cuenta` dentro de `#main-header` |
+| `input[placeholder='RUT']` | `input#document` (placeholder `Ej: 12345678-9`, `maxlength=10`, formatea el RUT solo) |
+| `input[placeholder='Clave Internet']` | `input#pass` (`maxlength=6`) |
+| `button#desktop-login` | El `button[type=submit]` del form del drawer (texto "Ingresar"), deshabilitado hasta que ambos campos son válidos |
+
+Además el formulario ya no está en la página: vive en un **drawer** que monta sus inputs sólo al clickear "Mi Cuenta". Las clases son CSS-modules con hash (`MiddleNav_buttonPrimary__09N_a`, `DrawerFormLogin_form-container__k1Si1`) y cambian en cada deploy, así que no sirven como selectores.
+
+**Fix (`scraper/bank_scraper.py`):**
+- `login()`: sólo anclas estables — el id `#main-header`, el texto del botón (`button:visible` + `has_text="Mi Cuenta"`), y los ids `#document` / `#pass`. Nada de clases con hash.
+- **Re-click por hidratación:** Next.js sirve el header por SSR antes de montar el handler, así que el primer click puede caer al vacío. Si `#document` no aparece en 6s, se reintenta el click una vez antes de fallar.
+- **RUT sin puntos:** el campo tiene `maxlength=10`, así que un RUT con puntos (12 caracteres) se truncaría al escribirlo carácter por carácter. Se manda `self.username.replace(".", "")`. **Ojo con `#pass`: tiene `maxlength=6`.** La clave internet de 6 dígitos entra justo; si tu `FALABELLA_PASSWORD` es más largo, el campo lo trunca en silencio y el login falla con este mismo síntoma.
+- **Submit sin clases con hash:** se ancla con `form:has(#pass) button[type='submit']:not([disabled])`, manteniendo la espera a que se habilite.
+- **No se usa `placeholder` en ningún selector:** la home tiene un simulador de crédito con un input `Ingresa tu RUT` que un selector laxo por placeholder engancharía.
+- `_dismiss_service_popup()`: ahora exige que el botón `Entendido` esté **dentro** del popup de servicio (se sube por los ancestros — atravesando shadow roots, sin pasar de `<body>` — buscando el texto "no lo podemos atender"). El sitio nuevo tiene otros dos `Entendido`: el aviso de cookies y `#btn-login-client-nuevo`, **dentro del drawer de login**. Ese segundo es el riesgo real: en los reintentos de login el drawer queda abierto y la versión anterior podía clickearlo.
+
+**Verificado:** dos corridas locales `python main.py --mode scraper --headless` → `success`, `Login exitoso` en ~5s, sin screenshots de error. El área privada (Angular + Shadow DOM) **no cambió**: tabla, modales de detalle y extracción del período siguen funcionando sin tocar nada.
+
+**Limpieza de datos:** no se requiere. `_reset_pending()` corre **después** del login y de `navigate_to_movements()`, así que las corridas fallidas nunca tocan `movimientos` — sólo dejan filas con `estado = error` en `scraper_runs`. Los pendientes quedan congelados en los de la última corrida exitosa y se refrescan solos en la primera corrida verde. Si querés verificar el hueco:
+
+```sql
+-- corridas fallidas del período
+SELECT id, inicio, estado, left(coalesce(error, ''), 80)
+  FROM scraper_runs WHERE estado = 'error' ORDER BY id DESC LIMIT 10;
+
+-- antigüedad de los pendientes actuales (deberían ser de la última corrida verde)
+SELECT count(*), max(fecha_compra) FROM movimientos WHERE pendiente = TRUE;
+```
+
+
 ## 2026-08-14
 
 ### Fix: modal de opt-in CMR Puntos bloqueaba el click en la tarjeta
