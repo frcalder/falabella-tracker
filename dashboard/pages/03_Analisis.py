@@ -33,8 +33,8 @@ def get_data(_conn):
 
 @st.cache_data(ttl=300)
 def get_expanded(_conn, df):
-    """expand_splits es un loop fila por fila y la página rerunea con cada click, así que
-    conviene cachearlo en vez de recalcularlo en cada interacción."""
+    """expand_splits recorre fila por fila y la página se vuelve a ejecutar con cada clic, así
+    que conviene cachearlo en vez de recalcularlo en cada interacción."""
     return expand_splits(df, _conn)
 
 
@@ -258,7 +258,7 @@ with col_bars:
         apply_layout(fig_prog, height=max(300, len(con_ppto) * 46),
                      showlegend=True, margin=dict(l=0, r=150, t=44, b=6),
                      # con el default, el primer click se lo come el modo zoom y hay que
-                     # clickear dos veces para seleccionar una categoría
+                     # hacer clic dos veces para seleccionar una categoría
                      clickmode="event+select",
                      legend=dict(orientation="h", yanchor="bottom", y=1.02,
                                  xanchor="left", x=0))
@@ -281,7 +281,7 @@ with col_bars:
                     sel_bar = int(fila.iloc[0]["categoria_id"])
     else:
         st.info("Ninguna categoría tiene presupuesto asignado en este período. "
-                "Asignalos en la pestaña Presupuesto.")
+                "Asígnalos en la pestaña Presupuesto.")
 
     # ── Gasto sin presupuesto: contexto, no protagonista ──────────────────────
     # Va aparte y plegado a propósito: no es gestionable y parte puede volver como reembolso,
@@ -294,7 +294,7 @@ with col_bars:
         ):
             st.caption("Gasto no gestionable: sin tope asignado, y parte puede volver como "
                        "reembolso. No entra en el medidor ni en el delta de arriba. "
-                       "Seleccioná una fila para ver sus movimientos.")
+                       "Selecciona una fila para ver sus movimientos.")
             # Texto y no número: `column_config` no tiene locale, así que un NumberColumn
             # mostraría $1,914,756 en una página donde todo lo demás dice $1.914.756. La lista
             # ya viene ordenada por monto, así que no se pierde nada.
@@ -337,7 +337,7 @@ with col_table:
 
     if selected_id is None or selected_cat is None:
         st.subheader("Movimientos")
-        st.caption("← Haz click en una categoría para ver sus movimientos")
+        st.caption("← Haz clic en una categoría para ver sus movimientos")
     else:
         st.subheader(selected_cat)
         df_cat = df_periodo[df_periodo["categoria_id"] == selected_id].copy()
@@ -471,7 +471,7 @@ else:
     if selected_id is not None and selected_cat:
         # Escala propia para la categoría: contra el total del mes su barra sería una astilla y
         # no se vería su tendencia. El contexto del mes completo ya está en las tarjetas de
-        # arriba; acá lo que interesa es la categoría y su propio tope.
+        # arriba; aquí lo que interesa es la categoría y su propio tope.
         serie = (df_cargos[(df_cargos["periodo"].isin(periodos_hist)) &
                            (df_cargos["categoria_id"] == selected_id)]
                  .groupby("periodo")["monto_periodo"].sum())
@@ -528,7 +528,7 @@ else:
     if selected_id is not None and selected_cat:
         st.caption(f"Gasto de {selected_cat} mes a mes, en su propia escala, con el color del "
                    "estado contra su tope. La marca horizontal es su presupuesto del período. "
-                   "Deseleccioná la categoría arriba para volver a la vista general.")
+                   "Deselecciona la categoría arriba para volver a la vista general.")
     else:
         st.caption("En color, el gasto de las categorías con presupuesto — el gestionable. "
                    "En gris, el resto. La marca horizontal es el presupuesto total del período.")

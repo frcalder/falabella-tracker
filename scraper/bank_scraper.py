@@ -77,7 +77,7 @@ JS_HAS_BLOCKING_BACKDROP = """
 }
 """
 
-# Cierra el modal promocional buscando su botón ×. Nunca clickea 'Acepto': ese botón
+# Cierra el modal promocional buscando su botón ×. Nunca hace clic en 'Acepto': ese botón
 # inscribe al usuario en el programa CMR Puntos y autoriza comunicaciones comerciales.
 JS_CLICK_PROMO_CLOSE = """
 () => {
@@ -829,7 +829,7 @@ class FalabellaScraper:
 
         El botón se busca por texto ('Entendido') **y** por contexto: el sitio público
         tiene otros dos 'Entendido' (el aviso de cookies y `#btn-login-client-nuevo`,
-        dentro del drawer de login) que no deben clickearse.
+        dentro del drawer de login) en los que no se debe hacer clic.
         """
         JS_POPUP = """
         (mode) => {
@@ -940,7 +940,7 @@ class FalabellaScraper:
 
         # Desde 2026-08-18 el sitio público es un Next.js: el header ya no tiene
         # `#main-header__sub-content` y el formulario vive en un drawer que monta sus
-        # inputs solo al clickear "Mi Cuenta". Las clases son CSS-modules con hash
+        # inputs solo al hacer clic en "Mi Cuenta". Las clases son CSS-modules con hash
         # (cambian en cada deploy), así que solo se usan anclas estables: el id
         # `#main-header`, el texto del botón y los ids `#document` / `#pass`.
         login_btn = page.locator("#main-header button:visible", has_text="Mi Cuenta").first
@@ -967,7 +967,7 @@ class FalabellaScraper:
 
         if not await rut_field.is_visible():
             await self._screenshot(page, "login_rut_not_found", error=True)
-            logger.error("No apareció el campo RUT tras hacer click en 'Mi Cuenta'")
+            logger.error("No apareció el campo RUT tras hacer clic en 'Mi Cuenta'")
             return False
 
         # El campo formatea el RUT solo y tiene maxlength=10: hay que escribirlo sin puntos.
@@ -1028,12 +1028,12 @@ class FalabellaScraper:
             await card_link.click(timeout=15000)
         except Exception:
             # Un modal apareció después del dismiss: cerrar y reintentar.
-            logger.warning("Click en la tarjeta bloqueado — cerrando modales y reintentando")
+            logger.warning("Clic en la tarjeta bloqueado — cerrando modales y reintentando")
             await self._dismiss_blocking_modals(page)
             try:
                 await card_link.click(timeout=10000)
             except Exception:
-                logger.warning("Click bloqueado de nuevo — usando click directo en el DOM")
+                logger.warning("Clic bloqueado de nuevo — usando clic directo en el DOM")
                 await card_link.evaluate("el => el.click()")
 
         try:
@@ -1209,7 +1209,7 @@ class FalabellaScraper:
             await page.wait_for_timeout(2000)
 
     async def _billed_state(self, page: Page, tries: int = 25, confirm: int = 3) -> str:
-        """Estado de la vista. `con_filas` se acepta al toque; un estado vacío o de error hay
+        """Estado de la vista. `con_filas` se acepta de inmediato; un estado vacío o de error hay
         que verlo `confirm` veces seguidas para creerlo (evita leer el render anterior)."""
         state, repetido, previo = "cargando", 0, ""
         for _ in range(tries):
@@ -1302,7 +1302,7 @@ class FalabellaScraper:
 
         `_next_page_rect` busca el botón › y devuelve None si está deshabilitado o mide 0×0. Si
         Angular está a mitad de un update cuando se evalúa, el botón puede estar en cualquiera de
-        esos dos estados sin que la paginación haya terminado — y un falso negativo acá corta la
+        esos dos estados sin que la paginación haya terminado — y un falso negativo aquí corta la
         lectura a mitad del estado de cuenta. Observado: una lectura de 2026-05 se detuvo en la
         página 3 de 5 y reportó "no falta ninguna fila" con 4 filas realmente faltantes.
         """
@@ -1633,7 +1633,7 @@ class FalabellaScraper:
         await page.wait_for_timeout(1200)  # espera fija para animación de cierre
 
     async def _click_row(self, page: Page, index: int) -> bool:
-        """Intenta clickear la fila; si está bloqueada cierra el modal y reintenta una vez."""
+        """Intenta hacer clic en la fila; si está bloqueada cierra el modal y reintenta una vez."""
         row = page.locator(self.row_selector).nth(index)
         try:
             await row.click(timeout=8000)
@@ -1646,7 +1646,7 @@ class FalabellaScraper:
             await row.click(timeout=8000)
             return True
         except Exception:
-            logger.warning(f"    Fila {index} no clickeable tras reintento — saltando")
+            logger.warning(f"    Fila {index} no admite clic tras reintento — saltando")
             return False
 
     async def _open_and_read_detail(self, page: Page, index: int) -> Dict[str, str]:

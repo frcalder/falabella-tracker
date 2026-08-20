@@ -36,21 +36,21 @@ El caso de `2026-05` es distinto de los otros: no le faltaba la cola del ciclo s
 
 **Una corrida abortó y se comportó bien:** el primer intento de `2026-04` falló con `seleccion_fallida` (el dropdown no confirmó el estado de cuenta pedido), no escribió nada y **no marcó** el período. El reintento lo completó.
 
-**Cómo recuperar tus propios períodos:** buscá los que tengan `max(fecha)` varios días antes del cierre —
+**Cómo recuperar tus propios períodos:** busca los que tengan `max(fecha)` varios días antes del cierre —
 
 ```sql
 SELECT periodo, count(*), min(fecha), max(fecha)
   FROM movimientos GROUP BY periodo ORDER BY periodo DESC;
 ```
 
-— y corré cada uno con dry-run primero, **leyendo la lista de candidatas antes de escribir**:
+— y ejecuta cada uno con dry-run primero, **leyendo la lista de candidatas antes de escribir**:
 
 ```bash
 python main.py --mode scraper --headless --backfill-periodo 2026-05 --backfill-dry-run
 python main.py --mode scraper --headless --backfill-periodo 2026-05
 ```
 
-Si una corrida aborta (`seleccion_fallida`, o el aviso de lectura cortada), no escribió nada y no marcó el período: se reintenta y listo.
+Si una ejecución se aborta (`seleccion_fallida`, o el aviso de lectura cortada), no escribió nada ni marcó el período: basta con reintentarla.
 
 **Limpieza de datos:** no se requiere.
 
@@ -89,7 +89,7 @@ Y una cuarta, de honestidad: el período en curso está incompleto por definici�
 **Bugs vivos arreglados de paso:**
 - **`pct` es `NaN`, no `None`.** `get_resumen_vs_presupuesto` devuelve `None` desde un `apply` y pandas lo convierte a NaN en una Series float64, así que la guarda `x is not None` era `True`: una categoría sin presupuesto pero con gasto mostraba la etiqueta **`"nan%"`** y caía en el color de "todo bien". Ahora se usa `pd.isna()` y esas categorías no van al gráfico de progreso.
 - **La selección viaja por `customdata`** (el id de la categoría) y no por el texto del eje y, que se rompía con cualquier cambio de etiqueta. Se deja el nombre como respaldo.
-- **`expand_splits` cacheado.** Es un loop `iterrows` que corría en cada rerun, y la página rerunea con cada click.
+- **`expand_splits` cacheado.** Es un loop `iterrows` que se ejecutaba en cada rerun, y la página se vuelve a ejecutar con cada clic.
 - **La fila TOTAL salió de la tabla** al pie. Además de leerse mejor, el guardado la esquivaba con `edited.iloc[:-1]`, que deja de apuntar a la fila TOTAL en cuanto se ordena la tabla por otra columna.
 - **Dos montos en un mismo `st.caption` se renderizaban como fórmula LaTeX**: Streamlit interpreta el par de `$` como matemática. De ahí `money_md()`, que escapa el signo.
 - Tope de alto en la tabla del drill-down: una categoría con 30 movimientos estiraba la página entera.
@@ -98,7 +98,7 @@ Y una cuarta, de honestidad: el período en curso está incompleto por definici�
 
 **Limpieza de datos:** no se requiere. Tampoco hay migración: el rediseño es de dashboard.
 
-**Si venís de esta plantilla:** revisá si tus categorías comparten color, que era el síntoma original —
+**Si usas esta plantilla:** revisa si tus categorías comparten color, que era el síntoma original —
 
 ```sql
 SELECT color, count(*), string_agg(nombre, ', ')
@@ -139,7 +139,7 @@ SELECT color, count(*), string_agg(nombre, ', ')
 
 **Migración:** aplicar `analytics/migrations/007_backfill_facturados.sql` en el SQL Editor de Supabase — agrega `scraper_runs.backfill_periodo` (marca de idempotencia) y `movimientos.backfill_run_id` + índice parcial (procedencia, para revertir con exactitud). Los dos `ALTER` son metadata-only; si el statement queda colgado no es lentitud, es un lock (ver la query de `pg_stat_activity` en `CLAUDE.md`).
 
-**Recuperar los meses con hueco.** Si venís usando el scraper desde antes, es muy probable que te falte la cola de cada ciclo cerrado. Verificá el hueco:
+**Recuperar los meses con hueco.** Si vienes usando el scraper desde antes, es muy probable que te falte la cola de cada ciclo cerrado. Verifica el hueco:
 
 ```sql
 -- ¿hasta qué día llegó cada período? Un max(fecha) varios días antes del 19 es el síntoma.
@@ -147,7 +147,7 @@ SELECT periodo, count(*) filas, min(fecha) f_min, max(fecha) f_max
   FROM movimientos GROUP BY periodo ORDER BY periodo DESC;
 ```
 
-Y recuperá período por período, **con dry-run primero** y leyendo la lista de candidatas antes de escribir:
+Y recupéralos período por período, **con dry-run primero** y leyendo la lista de candidatas antes de escribir:
 
 ```bash
 python main.py --mode scraper --headless --backfill-periodo 2026-07 --backfill-dry-run
@@ -190,7 +190,7 @@ UPDATE scraper_runs SET backfill_periodo = NULL WHERE id = :run_id;  -- libera l
 | `input[placeholder='Clave Internet']` | `input#pass` (`maxlength=6`) |
 | `button#desktop-login` | El `button[type=submit]` del form del drawer (texto "Ingresar"), deshabilitado hasta que ambos campos son válidos |
 
-Además el formulario ya no está en la página: vive en un **drawer** que monta sus inputs sólo al clickear "Mi Cuenta". Las clases son CSS-modules con hash (`MiddleNav_buttonPrimary__09N_a`, `DrawerFormLogin_form-container__k1Si1`) y cambian en cada deploy, así que no sirven como selectores.
+Además el formulario ya no está en la página: vive en un **drawer** que monta sus inputs sólo al hacer clic en "Mi Cuenta". Las clases son CSS-modules con hash (`MiddleNav_buttonPrimary__09N_a`, `DrawerFormLogin_form-container__k1Si1`) y cambian en cada deploy, así que no sirven como selectores.
 
 **Fix (`scraper/bank_scraper.py`):**
 - `login()`: sólo anclas estables — el id `#main-header`, el texto del botón (`button:visible` + `has_text="Mi Cuenta"`), y los ids `#document` / `#pass`. Nada de clases con hash.
@@ -198,11 +198,11 @@ Además el formulario ya no está en la página: vive en un **drawer** que monta
 - **RUT sin puntos:** el campo tiene `maxlength=10`, así que un RUT con puntos (12 caracteres) se truncaría al escribirlo carácter por carácter. Se manda `self.username.replace(".", "")`. **Ojo con `#pass`: tiene `maxlength=6`.** La clave internet de 6 dígitos entra justo; si tu `FALABELLA_PASSWORD` es más largo, el campo lo trunca en silencio y el login falla con este mismo síntoma.
 - **Submit sin clases con hash:** se ancla con `form:has(#pass) button[type='submit']:not([disabled])`, manteniendo la espera a que se habilite.
 - **No se usa `placeholder` en ningún selector:** la home tiene un simulador de crédito con un input `Ingresa tu RUT` que un selector laxo por placeholder engancharía.
-- `_dismiss_service_popup()`: ahora exige que el botón `Entendido` esté **dentro** del popup de servicio (se sube por los ancestros — atravesando shadow roots, sin pasar de `<body>` — buscando el texto "no lo podemos atender"). El sitio nuevo tiene otros dos `Entendido`: el aviso de cookies y `#btn-login-client-nuevo`, **dentro del drawer de login**. Ese segundo es el riesgo real: en los reintentos de login el drawer queda abierto y la versión anterior podía clickearlo.
+- `_dismiss_service_popup()`: ahora exige que el botón `Entendido` esté **dentro** del popup de servicio (se sube por los ancestros — atravesando shadow roots, sin pasar de `<body>` — buscando el texto "no lo podemos atender"). El sitio nuevo tiene otros dos `Entendido`: el aviso de cookies y `#btn-login-client-nuevo`, **dentro del drawer de login**. Ese segundo es el riesgo real: en los reintentos de login el drawer queda abierto y la versión anterior podía hacerle clic.
 
 **Verificado:** dos corridas locales `python main.py --mode scraper --headless` → `success`, `Login exitoso` en ~5s, sin screenshots de error. El área privada (Angular + Shadow DOM) **no cambió**: tabla, modales de detalle y extracción del período siguen funcionando sin tocar nada.
 
-**Limpieza de datos:** no se requiere. `_reset_pending()` corre **después** del login y de `navigate_to_movements()`, así que las corridas fallidas nunca tocan `movimientos` — sólo dejan filas con `estado = error` en `scraper_runs`. Los pendientes quedan congelados en los de la última corrida exitosa y se refrescan solos en la primera corrida verde. Si querés verificar el hueco:
+**Limpieza de datos:** no se requiere. `_reset_pending()` corre **después** del login y de `navigate_to_movements()`, así que las corridas fallidas nunca tocan `movimientos` — sólo dejan filas con `estado = error` en `scraper_runs`. Los pendientes quedan congelados en los de la última corrida exitosa y se refrescan solos en la primera corrida verde. Si quieres verificar el hueco:
 
 ```sql
 -- corridas fallidas del período
@@ -266,13 +266,13 @@ O sea: sin evidencia de exposición, pero a una filtración de la anon key de qu
 
 **Fix (`analytics/migrations/006_enable_rls.sql`):** `ENABLE ROW LEVEL SECURITY` en las 7 tablas, **sin políticas** — RLS deniega por defecto, así que los roles de la API quedan sin acceso a ninguna fila. La aplicación no se ve afectada porque conecta con el rol `postgres`, que tiene `rolbypassrls = TRUE`. `analytics/schema.sql` actualizado al estado final.
 
-**Si venís de esta plantilla, tu proyecto tiene la misma alerta.** Antes de correr la migración, verificá con qué rol conecta tu app:
+**Si usas esta plantilla, tu proyecto tiene la misma alerta.** Antes de ejecutar la migración, verifica con qué rol conecta tu app:
 
 ```sql
 SELECT current_user, rolbypassrls FROM pg_roles WHERE rolname = current_user;
 ```
 
-Si da `rolbypassrls = false`, creá primero una política para ese rol o vas a dejar la aplicación sin datos. Después de aplicar, confirmá el estado:
+Si da `rolbypassrls = false`, crea primero una política para ese rol o dejarás la aplicación sin datos. Después de aplicar, confirma el estado:
 
 ```sql
 SELECT relname, relrowsecurity FROM pg_class
@@ -345,8 +345,8 @@ Si aparecen sesiones ahí, un redeploy del dashboard las libera — pero el fix 
 **Fix (`scraper/bank_scraper.py`):**
 - `page.goto(..., wait_until="domcontentloaded")` en vez de `networkidle`.
 - `p.chromium.launch(args=["--disable-blink-features=AutomationControlled"])` + user-agent de Chrome real + `add_init_script` para anular `navigator.webdriver`.
-- `_dismiss_service_popup()`: usa `wait_for_function` + `page.evaluate()` con traversal recursivo de shadow roots para encontrar y clickear "Entendido". Se llama al cargar la página y tras enviar credenciales si "Hola" no aparece.
-- `wait_for_selector` en el botón de login antes de clickearlo.
+- `_dismiss_service_popup()`: usa `wait_for_function` + `page.evaluate()` con traversal recursivo de shadow roots para encontrar y hacer clic en "Entendido". Se llama al cargar la página y tras enviar credenciales si "Hola" no aparece.
+- `wait_for_selector` en el botón de login antes de hacerle clic.
 - `_screenshot(..., error=True)`: nuevo parámetro que guarda el screenshot siempre (sin `--debug`) en puntos de falla. Aplicado en todos los errores de login, carga de tabla y excepción inesperada en el run.
 - `_finish_run` guarda el status en `self._run_status`; `main()` llama `sys.exit(1)` si es `"error"`.
 

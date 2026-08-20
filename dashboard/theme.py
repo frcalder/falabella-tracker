@@ -123,8 +123,8 @@ def apply_layout(fig: go.Figure, height: Optional[int] = None, **kwargs) -> go.F
     """Layout común de todos los gráficos del dashboard.
 
     Deliberadamente **no** fija colores de fuente ni de fondo: `st.plotly_chart` aplica por
-    defecto el template de Streamlit, que ya los deriva del tema activo. Fijarlos acá rompería
-    el modo oscuro. Acá va solo lo que ese template no cubre.
+    defecto el template de Streamlit, que ya los deriva del tema activo. Fijarlos aquí rompería
+    el modo oscuro. Aquí va solo lo que ese template no cubre.
     """
     layout = dict(
         # separators: primer carácter = decimal, segundo = miles. ",." da 1.234.567 (formato CL),
