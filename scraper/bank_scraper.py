@@ -342,6 +342,7 @@ class FalabellaScraper:
     # en los mismos índices y `_read_row` sirve sin cambios.
     BILLED_ROW_SELECTOR = "app-invoiced-movements table tbody tr"
     BILLED_TAB_LABEL = "Movimientos facturados"
+    BILLED_PAGE_SIZE = 20  # filas por página en la vista de facturados
 
     def __init__(self, headless: bool = False, debug_mode: bool = False):
         self.username = os.getenv("FALABELLA_USER")
@@ -1296,13 +1297,29 @@ class FalabellaScraper:
             return "seleccion_fallida"
         return state
 
+    async def _billed_has_next(self, page: Page, intentos: int = 3) -> bool:
+        """¿Hay página siguiente? Con reintentos, porque el chequeo da falsos negativos.
+
+        `_next_page_rect` busca el botón › y devuelve None si está deshabilitado o mide 0×0. Si
+        Angular está a mitad de un update cuando se evalúa, el botón puede estar en cualquiera de
+        esos dos estados sin que la paginación haya terminado — y un falso negativo acá corta la
+        lectura a mitad del estado de cuenta. Observado: una lectura de 2026-05 se detuvo en la
+        página 3 de 5 y reportó "no falta ninguna fila" con 4 filas realmente faltantes.
+        """
+        for i in range(intentos):
+            if await self._has_next_page(page):
+                return True
+            if i < intentos - 1:
+                await page.wait_for_timeout(1200)
+        return False
+
     async def _billed_collect(self, page: Page) -> List[tuple]:
         """Fase 1: recorre las páginas leyendo SOLO celdas de tabla. No abre modales ni escribe.
 
         Devuelve [(nro_pagina, indice_fila, movimiento, clave), ...].
         """
         collected: List[tuple] = []
-        page_num, prev_sig = 0, ""
+        page_num, prev_sig, ultima_llena = 0, "", False
         while True:
             page_num += 1
             total = await self._count_rows(page)
@@ -1322,10 +1339,20 @@ class FalabellaScraper:
                 collected.append((page_num, i, mv, self._movement_key(mv)))
                 leidas += 1
             logger.info(f"  Página {page_num}: {leidas} filas")
+            # Una paginación que termina bien lo hace con una página parcial. Si la última vino
+            # completa y encima el chequeo dice que no hay siguiente, es sospechoso de corte.
+            ultima_llena = leidas >= self.BILLED_PAGE_SIZE
 
-            if not await self._has_next_page(page):
+            if not await self._billed_has_next(page):
                 break
             await self._go_next_page(page)
+
+        if ultima_llena:
+            logger.warning(
+                f"  la última página vino completa ({self.BILLED_PAGE_SIZE} filas) y el botón de "
+                f"siguiente no apareció — la lectura pudo quedar cortada"
+            )
+            return []  # se aborta el pase: mejor reintentar mañana que marcar incompleto
         return collected
 
     async def _reconcile_log(self, page: Page, periodo: str, label: str) -> None:

@@ -1,5 +1,61 @@
 # Changelog
 
+## 2026-08-20 (4)
+
+### Fix: la lectura del estado de cuenta se cortaba a mitad y marcaba el período como completo
+
+**Síntoma:** al recuperar los períodos viejos con `--backfill-periodo`, el dry-run de `2026-05` leyó **60 filas en 3 páginas** y concluyó *"no falta ninguna fila"*. Una segunda corrida idéntica leyó **91 filas en 5 páginas** y encontró **4 filas faltantes**. En una corrida real la primera lectura habría marcado el período como completado dejando esas 4 filas afuera para siempre — exactamente la falla que la marca de idempotencia existe para evitar.
+
+**Causa raíz:** `_next_page_rect` busca el botón `›` y devuelve `None` si está deshabilitado o mide 0×0. Si Angular está a mitad de un update cuando se evalúa, el botón puede estar en cualquiera de esos dos estados **sin que la paginación haya terminado**. Un solo falso negativo corta la lectura. Agrava el problema que el `wait_for_function` de `_go_next_page` usa `document.querySelector`, que no atraviesa shadow DOM: siempre falla y cae en una espera fija de 2s, así que el estado de la página al momento del chequeo es una carrera.
+
+**Fix (`scraper/bank_scraper.py`):**
+- `_billed_has_next()`: reintenta el chequeo hasta 3 veces con 1,2s de espera antes de aceptar que la paginación terminó.
+- **Guarda de corte**: una paginación que termina bien lo hace con una página **parcial**. Si la última página vino completa (20 filas) y aun así el botón de siguiente no aparece, se loguea un warning y **se aborta el pase devolviendo 0 filas** — que por el camino del `total == 0` no marca el período. Mejor reintentar mañana que marcar incompleto.
+
+**Verificado:** dos lecturas consecutivas de `2026-05` dan 91 filas / 5 páginas / 4 faltantes, idénticas.
+
+### Recuperación de los períodos con la cola cortada
+
+_Lo que sigue son los resultados de una instalación real, a modo de ejemplo de qué esperar._
+
+Con el fix arriba, se recuperaron los cinco períodos cerrados que tenían el final del ciclo incompleto. **19 filas en total**, todas confirmadas (`pendiente = FALSE`) y con su valor de cuota correcto:
+
+| período | filas antes → después | max(fecha) antes → después | recuperadas |
+|---|---|---|---|
+| 2026-03 | 111 → 115 | 18/03 → 19/03 | 4 (3 UBER EATS + una `DEVOLUCION` de −$7.980) |
+| 2026-04 | 96 → 99 | 17/04 → 18/04 | 3 |
+| 2026-05 | 87 → 91 | 17/05 (sin cambio) | 4 cuotas |
+| 2026-06 | 92 → 94 | 17/06 → 18/06 | 2 |
+| 2026-07 | 91 → 97 | 18/07 → 19/07 | 6 |
+
+El caso de `2026-05` es distinto de los otros: no le faltaba la cola del ciclo sino **cuatro cuotas en el medio de series por lo demás completas**. La de MP *RODACORP iba `04/12` (mar), `05/12` (abr), **hueco**, `07/12` (jun)… y ahora la serie está entera: `04/12 · 05/12 · 06/12 · 07/12 · 08/12 · 09/12 · 10/12`. Los auth codes de las filas insertadas coinciden con los de esas mismas compras en los otros períodos, y no colisionaron porque `num_cuotas` es parte de la llave única.
+
+**Efecto secundario bueno:** las clasificaciones huérfanas por `codigo_autorizacion` bajaron de **39 a 34** — cinco categorizaciones hechas sobre movimientos que habían desaparecido volvieron a tener su fila.
+
+**Integridad verificada** contra la línea base: los duplicados por clave natural siguen en 2 (el par ANTHROPIC preexistente de 2026-03), 0 auth codes en más de un período, 0 duplicados de `(tx_hash, periodo)`, y ningún período distinto del objetivo se movió. Todas las filas nuevas llevan `backfill_run_id`, así que son reversibles con exactitud.
+
+**Una corrida abortó y se comportó bien:** el primer intento de `2026-04` falló con `seleccion_fallida` (el dropdown no confirmó el estado de cuenta pedido), no escribió nada y **no marcó** el período. El reintento lo completó.
+
+**Cómo recuperar tus propios períodos:** buscá los que tengan `max(fecha)` varios días antes del cierre —
+
+```sql
+SELECT periodo, count(*), min(fecha), max(fecha)
+  FROM movimientos GROUP BY periodo ORDER BY periodo DESC;
+```
+
+— y corré cada uno con dry-run primero, **leyendo la lista de candidatas antes de escribir**:
+
+```bash
+python main.py --mode scraper --headless --backfill-periodo 2026-05 --backfill-dry-run
+python main.py --mode scraper --headless --backfill-periodo 2026-05
+```
+
+Si una corrida aborta (`seleccion_fallida`, o el aviso de lectura cortada), no escribió nada y no marcó el período: se reintenta y listo.
+
+**Limpieza de datos:** no se requiere.
+
+
+
 ## 2026-08-20 (3)
 
 ### Rediseño de la vista Análisis
