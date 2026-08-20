@@ -1,0 +1,13 @@
+# Tema explícito del dashboard.
+#
+# Sin este archivo Streamlit usa su tema por defecto, que sigue la preferencia del sistema de
+# quien visita la app: el mismo dashboard se ve distinto según el visitante, y los colores
+# hardcodeados de los gráficos dejan de coordinar con el fondo. Los valores son los de la paleta
+# validada de `dashboard/theme.py` — ver ahí las reglas de uso.
+[theme]
+base = "light"
+primaryColor = "#2a78d6"              # slot 1 de la paleta: botones primarios, foco, selección
+backgroundColor = "#fcfcfb"           # superficie de los gráficos
+secondaryBackgroundColor = "#f2f1ed"  # barra lateral, inputs, celdas de tabla
+textColor = "#0b0b0b"
+font = "sans serif"

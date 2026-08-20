@@ -42,4 +42,9 @@ ENV/
 debug/
 
 # Streamlit
-.streamlit/ 
+# Los secretos del dashboard no se versionan, pero el tema sí: si se ignora el directorio
+# completo, `config.toml` nunca llega a Streamlit Cloud y la app se despliega sin tema. El
+# patrón ignora todo por defecto y hace una excepción explícita, así que cualquier archivo
+# nuevo que se agregue acá sigue quedando fuera de git.
+.streamlit/*
+!.streamlit/config.toml

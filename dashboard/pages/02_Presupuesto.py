@@ -108,11 +108,14 @@ st.subheader("Categorías")
 with st.expander("Agregar nueva categoría"):
     with st.form("nueva_categoria"):
         nombre_nuevo = st.text_input("Nombre")
-        color_nuevo = st.color_picker("Color", "#9E9E9E")
+        # Sin selector de color a propósito: los gráficos codifican el estado contra el
+        # presupuesto (paleta validada en `dashboard/theme.py`), no la identidad de la
+        # categoría. Elegir un color acá no cambiaba nada visual y en la práctica dejaba
+        # a casi todas las categorías con el mismo gris por defecto.
         submitted = st.form_submit_button("Crear")
         if submitted and nombre_nuevo.strip():
             try:
-                create_categoria(conn, nombre_nuevo.strip(), color_nuevo)
+                create_categoria(conn, nombre_nuevo.strip())
                 st.success(f"Categoría '{nombre_nuevo}' creada.")
                 st.rerun()
             except Exception as e:

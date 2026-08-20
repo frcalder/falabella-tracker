@@ -1,5 +1,58 @@
 # Changelog
 
+## 2026-08-20 (3)
+
+### Rediseño de la vista Análisis
+
+**Problema:** la página funcionaba pero el gráfico de abajo, "Tendencia por categoría", no aportaba. Medido, no era cuestión de gusto — fallaba en tres capas a la vez:
+
+1. **Dibujaba hasta 16 líneas.** El techo legible para series categóricas es 7–8; pasado eso hay que plegar la cola, facetear o usar énfasis.
+2. **Nueve de las 19 categorías tenían el mismo gris `#9E9E9E`** — entre ellas la 3ª y 4ª por gasto histórico. Nueve líneas del mismo color. El validador de paleta sobre las 6 categorías de mayor gasto daba `ΔE 0.0` y el veredicto *"hard to tell apart even with full color vision"*. La causa estaba en el código: `create_categoria` y el `st.color_picker` de Presupuesto arrancaban los dos en ese gris, así que toda categoría creada sin tocar el selector salía gris.
+3. **El tooltip estaba roto.** `f"...<br>${{y:,.0f}}<extra></extra>"` le pasaba a plotly el texto literal `${y:,.0f}` en vez de `%{y:$,.0f}`, así que el hover nunca mostró un monto.
+
+Y una cuarta, de honestidad: el período en curso está incompleto por definición, así que cualquier serie histórica que lo incluyera sin marcarlo terminaba en una caída inexistente.
+
+**Cambio de fondo en la jerarquía.** El gasto **con presupuesto** es el único gestionable; el gasto sin presupuesto no se administra y parte puede volver como reembolso. La página ahora lo refleja en todos sus bloques en vez de mezclar los dos.
+
+**El gráfico de abajo, "Gasto por período".** Reemplaza a la tendencia. Barra azul desde cero = gasto de las categorías con presupuesto; gris apilada arriba = el resto; marca horizontal = presupuesto total del período. De un golpe se ve en qué meses el gasto gestionable cruzó el tope. El período en curso va con trama y la etiqueta `· en curso`. Al seleccionar una categoría arriba, el mismo gráfico pasa a **modo énfasis**: esa categoría mes a mes **en su propia escala** (contra el total del mes su barra sería una astilla), coloreada por su estado contra su propio tope, con su presupuesto como marca en cada mes.
+
+**El presupuesto pasa a ser marca de objetivo, no barra de fondo.** La barra fantasma gris quedaba **completamente tapada justo cuando importa**: cuando el gasto supera el tope. Ahora es una marca perpendicular, visible siempre, dentro o fuera de la barra — la lectura de un bullet chart.
+
+**Escalas separadas.** Las barras de progreso ya no comparten eje con las categorías sin presupuesto: antes la más grande de esas ($1.914.756 en agosto) fijaba la escala y aplastaba a todas las gestionables (máx $859.604). El bloque sin presupuesto se movió a un expander propio, plegado, con su total en el título y su tabla seleccionable.
+
+**Estado con ícono y texto, nunca solo color.** Las etiquetas pasan a `⚑ 434% · $434.421`, `⚠ 97% · $116.768`, `✓ 72% · $115.970`, con la paleta de estado fija (`#0ca30c` / `#fab219` / `#d03b3b`).
+
+**Se elimina el color por categoría.** Con 19 categorías y 8 slots validados, codificar identidad con color nunca iba a cerrar. El color queda reservado para lo que tiene pocos valores y mucho significado — el estado contra el presupuesto — y la identidad la cargan la posición, el nombre y el detalle de una categoría a la vez. **Se saca el selector de color** del alta de categoría, que era la fuente del gris repetido. Sin migración y sin escrituras en la DB: la columna `color` queda como está y deja de tener uso visual.
+
+**Módulo nuevo `dashboard/theme.py`** (antes no había ningún módulo compartido del dashboard): paleta validada (8 slots claro/oscuro + estado + chrome), `money()` en formato chileno (`$1.234.567` en vez de `$1,234,567`), `money_md()`, `status_of()` tolerante a NaN, `apply_layout()` y `periodo_corto()`. La paleta pasa los seis chequeos en claro y oscuro; el orden de los slots es el mecanismo de seguridad, no cosmética, y está documentado en el módulo junto al comando para re-validar.
+
+**Tema explícito `.streamlit/config.toml`.** No existía, así que la app tomaba el tema por defecto de Streamlit, que sigue la preferencia del sistema de cada visitante. Como `.gitignore` ignoraba `.streamlit/` completo, el patrón pasó a `.streamlit/*` + `!.streamlit/config.toml` — si no, el tema nunca llegaba a Streamlit Cloud. `secrets.toml` sigue ignorado (verificado con `git add --dry-run`).
+
+**Modo oscuro arreglado de paso.** `apply_layout()` no fija colores de fuente ni de fondo, así que los gráficos heredan la superficie del tema activo. Antes usaban el template `plotly` por defecto y salían con fondo blanco fijo, más un `rgba(200,200,200,0.35)` hardcodeado para la barra de presupuesto.
+
+**Bugs vivos arreglados de paso:**
+- **`pct` es `NaN`, no `None`.** `get_resumen_vs_presupuesto` devuelve `None` desde un `apply` y pandas lo convierte a NaN en una Series float64, así que la guarda `x is not None` era `True`: una categoría sin presupuesto pero con gasto mostraba la etiqueta **`"nan%"`** y caía en el color de "todo bien". Ahora se usa `pd.isna()` y esas categorías no van al gráfico de progreso.
+- **La selección viaja por `customdata`** (el id de la categoría) y no por el texto del eje y, que se rompía con cualquier cambio de etiqueta. Se deja el nombre como respaldo.
+- **`expand_splits` cacheado.** Es un loop `iterrows` que corría en cada rerun, y la página rerunea con cada click.
+- **La fila TOTAL salió de la tabla** al pie. Además de leerse mejor, el guardado la esquivaba con `edited.iloc[:-1]`, que deja de apuntar a la fila TOTAL en cuanto se ordena la tabla por otra columna.
+- **Dos montos en un mismo `st.caption` se renderizaban como fórmula LaTeX**: Streamlit interpreta el par de `$` como matemática. De ahí `money_md()`, que escapa el signo.
+- Tope de alto en la tabla del drill-down: una categoría con 30 movimientos estiraba la página entera.
+
+**Verificado en la app real**, que es un paso del método y no un extra: los tres estados (sin selección, con categoría seleccionada, período en curso), en claro y en oscuro. Y contra la DB, **los números no se movieron**: total presupuestado, gastado, sin presupuesto, total del período y el desglose por categoría son idénticos en los 7 períodos. El rediseño es visual; si un número se movía, era un bug.
+
+**Limpieza de datos:** no se requiere. Tampoco hay migración: el rediseño es de dashboard.
+
+**Si venís de esta plantilla:** revisá si tus categorías comparten color, que era el síntoma original —
+
+```sql
+SELECT color, count(*), string_agg(nombre, ', ')
+  FROM categorias GROUP BY color HAVING count(*) > 1;
+```
+
+— aunque después de este cambio ya no importa visualmente: el dashboard no usa el color de la categoría en ningún gráfico. Los montos que aparecen arriba son de una instalación real, a modo de ejemplo.
+
+
+
 ## 2026-08-20 (2)
 
 ### Feature: backfill del período facturado
