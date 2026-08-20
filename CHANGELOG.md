@@ -144,6 +144,65 @@ SELECT * FROM clasificaciones c
 
 Revisa el SELECT antes de borrar: una huérfana por `tx_hash` puede ser el duplicado benigno de una clasificación que ya migró a `codigo_autorizacion`, y borrarla no pierde información, pero las demás implican re-clasificar el movimiento a mano.
 
+### Seguridad: activar RLS en todas las tablas (alerta `rls_disabled_in_public` de Supabase)
+
+**Síntoma:** el linter de Supabase reporta "Table publicly accessible — anyone with your project URL can read, edit and delete all data in this table because Row-Level Security is not enabled".
+
+**Diagnóstico:** la alerta exagera al decir que basta la URL del proyecto (también hace falta la anon key, y este proyecto no usa la API REST ni `supabase-js`). Pero la superficie es real:
+- El endpoint REST está activo: `GET /rest/v1/movimientos` responde `401 No API key found`.
+- RLS desactivado en las 7 tablas, 0 políticas.
+- `anon` y `authenticated` tienen **todos** los privilegios en las 7 tablas, incluidos `DELETE` y `TRUNCATE`.
+
+O sea: sin evidencia de exposición, pero a una filtración de la anon key de que alguien lea, modifique o borre todo.
+
+**Fix (`analytics/migrations/006_enable_rls.sql`):** `ENABLE ROW LEVEL SECURITY` en las 7 tablas, **sin políticas** — RLS deniega por defecto, así que los roles de la API quedan sin acceso a ninguna fila. La aplicación no se ve afectada porque conecta con el rol `postgres`, que tiene `rolbypassrls = TRUE`. `analytics/schema.sql` actualizado al estado final.
+
+**Si venís de esta plantilla, tu proyecto tiene la misma alerta.** Antes de correr la migración, verificá con qué rol conecta tu app:
+
+```sql
+SELECT current_user, rolbypassrls FROM pg_roles WHERE rolname = current_user;
+```
+
+Si da `rolbypassrls = false`, creá primero una política para ese rol o vas a dejar la aplicación sin datos. Después de aplicar, confirmá el estado:
+
+```sql
+SELECT relname, relrowsecurity FROM pg_class
+ WHERE relname IN ('movimientos','categorias','clasificaciones','splits',
+                   'presupuestos','reglas_sugerencia','scraper_runs');
+SELECT count(*) AS politicas FROM pg_policies WHERE schemaname = 'public';
+```
+
+**El método importa para el próximo DDL.** Hacerlo con `autocommit = True` y `SET lock_timeout` de sesión **se cuelga**: el `SET` no protege al `ALTER`, que queda esperando el lock y encola todo lo demás (en la instalación de referencia abortó la corrida del scraper que estaba en curso). Lo que funciona es una **transacción explícita** con `SET LOCAL lock_timeout = '5s'` y los 7 `ALTER` dentro: atómico y con abort rápido si algún lock no está disponible. Con las transacciones liberadas (ver la entrada siguiente) los 7 `ALTER` corren en ~1,4 s.
+
+**Endurecimientos opcionales (no aplicados):** `REVOKE ALL ... FROM anon, authenticated` como segunda capa — los default privileges de Supabase vuelven a otorgar permisos en tablas nuevas, así que RLS es la capa durable — y desactivar la Data API o quitar `public` de los schemas expuestos, dado que el proyecto no la usa.
+
+**Limpieza de datos:** no se requiere, el cambio solo afecta permisos.
+
+### Fix: las lecturas dejaban transacciones abiertas y bloqueaban todo el DDL
+
+**Síntoma:** aplicar `006_enable_rls.sql` en el SQL Editor fallaba con `Error: SQL query ran into an upstream timeout`. Reintentar desde psycopg2 con `lock_timeout = '4s'` falló en las 7 tablas con `LockNotAvailable`.
+
+**Causa raíz:** no era lentitud ni el pooler. `pg_stat_activity` mostraba dos sesiones del dashboard (`application_name=Supavisor`) en estado **`idle in transaction`** desde más de media hora, sosteniendo `AccessShareLock` sobre tres tablas. `ALTER TABLE` necesita ACCESS EXCLUSIVE, así que quedaba en cola detrás de ellas hasta el timeout.
+
+El origen: psycopg2 abre una transacción implícita en el primer `execute`. Las funciones de solo lectura cerraban el cursor pero nunca hacían commit ni rollback, así que la transacción quedaba abierta. Como el dashboard cachea la conexión con `@st.cache_resource`, esa transacción vivía lo que vivía la app. Efecto secundario: autovacuum tampoco podía limpiar esas tablas.
+
+**Fix:**
+- `analytics/db.py`: nuevo context manager `read_cursor(conn)` — cierra el cursor y hace `rollback()` al salir, terminando la transacción implícita. **No** se usó `autocommit = True` a nivel de conexión a propósito: rompería la atomicidad de operaciones como reclasificar un split (borrar el split + insertar la clasificación bajo un solo commit).
+- Convertidas las 11 funciones de solo lectura: `analytics/loader.py` (3), `analytics/repository.py` (`get_categorias`, `get_presupuesto`, `get_presupuestos_periodo`, `get_clasificacion`, `get_splits`), `analytics/classifier.py` (`sugerir_categoria`, `aplicar_seed_desde_rubro`) y `dashboard/pages/04_Scraper.py` (`load_runs`). Las que escriben quedan intactas con su commit explícito.
+- `CLAUDE.md`: la nota de migraciones atribuía el timeout del DDL al session pooler. Era incorrecto; ahora explica que es un problema de locks, con la consulta de `pg_stat_activity` para diagnosticarlo.
+
+**Cómo detectarlo en tu instalación:**
+
+```sql
+SELECT pid, usename, application_name, state, now() - xact_start AS tx_abierta, left(query, 60)
+  FROM pg_stat_activity
+ WHERE datname = current_database() AND state = 'idle in transaction';
+```
+
+Si aparecen sesiones ahí, un redeploy del dashboard las libera — pero el fix de raíz es usar `read_cursor()` en toda ruta de lectura.
+
+**Limpieza de datos:** no se requiere.
+
 ## 2026-05-25
 
 ### Fix: reintentos automáticos de login + escritura humana de credenciales

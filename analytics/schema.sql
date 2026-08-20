@@ -107,3 +107,15 @@ CREATE INDEX IF NOT EXISTS idx_clasificaciones_cod_aut  ON clasificaciones(codig
 CREATE INDEX IF NOT EXISTS idx_clasificaciones_tx_hash  ON clasificaciones(tx_hash);
 CREATE INDEX IF NOT EXISTS idx_splits_cod_aut            ON splits(codigo_autorizacion);
 CREATE INDEX IF NOT EXISTS idx_splits_tx_hash            ON splits(tx_hash);
+
+-- Row Level Security: activado sin políticas en todas las tablas, de modo que los roles
+-- de la API de Supabase (`anon`, `authenticated`) no alcancen ninguna fila vía PostgREST.
+-- La app conecta con el rol `postgres` (rolbypassrls = TRUE) y no se ve afectada.
+-- Detalle y verificación: analytics/migrations/006_enable_rls.sql
+ALTER TABLE movimientos       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE categorias        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE clasificaciones   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE splits            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE presupuestos      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE reglas_sugerencia ENABLE ROW LEVEL SECURITY;
+ALTER TABLE scraper_runs      ENABLE ROW LEVEL SECURITY;

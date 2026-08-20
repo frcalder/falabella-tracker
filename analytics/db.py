@@ -2,6 +2,7 @@
 import os
 import psycopg2
 import psycopg2.extras
+from contextlib import contextmanager
 
 
 DDL_STATEMENTS = [
@@ -111,6 +112,28 @@ def get_connection() -> psycopg2.extensions.connection:
         keepalives_count=5,
     )
     return conn
+
+
+@contextmanager
+def read_cursor(conn: psycopg2.extensions.connection):
+    """Cursor para consultas de solo lectura, que cierra la transacción al terminar.
+
+    psycopg2 abre una transacción implícita en el primer execute. Si nadie hace
+    commit/rollback —lo normal en una lectura— la sesión queda `idle in transaction`
+    sosteniendo AccessShareLock sobre las tablas leídas. Con la conexión del dashboard
+    cacheada en `@st.cache_resource`, esa transacción vive lo que vive la app y:
+      - bloquea cualquier DDL (`ALTER TABLE` espera ACCESS EXCLUSIVE y queda en cola,
+        que es lo que hacía fallar las migraciones con "upstream timeout"),
+      - impide que autovacuum limpie las tablas.
+
+    Usar en toda función que solo lea. Las que escriben mantienen su commit explícito.
+    """
+    cur = conn.cursor()
+    try:
+        yield cur
+    finally:
+        cur.close()
+        conn.rollback()
 
 
 def init_db(conn: psycopg2.extensions.connection) -> None:

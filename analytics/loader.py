@@ -5,6 +5,8 @@ from typing import Optional
 import pandas as pd
 import psycopg2.extensions
 
+from .db import read_cursor
+
 
 def load_transactions(conn: psycopg2.extensions.connection) -> pd.DataFrame:
     """
@@ -12,12 +14,9 @@ def load_transactions(conn: psycopg2.extensions.connection) -> pd.DataFrame:
     y hace JOIN con clasificaciones de la DB.
     Retorna DataFrame listo para el dashboard.
     """
-    cur = conn.cursor()
-    try:
+    with read_cursor(conn) as cur:
         cur.execute("SELECT * FROM movimientos")
         rows = cur.fetchall()
-    finally:
-        cur.close()
 
     if not rows:
         return pd.DataFrame()
@@ -65,8 +64,7 @@ def load_transactions(conn: psycopg2.extensions.connection) -> pd.DataFrame:
     df["pendiente"] = df["pendiente"].astype(bool)
 
     # JOIN con clasificaciones y splits desde DB
-    cur = conn.cursor()
-    try:
+    with read_cursor(conn) as cur:
         cur.execute(
             "SELECT codigo_autorizacion, tx_hash, categoria_id, origen FROM clasificaciones"
         )
@@ -77,8 +75,6 @@ def load_transactions(conn: psycopg2.extensions.connection) -> pd.DataFrame:
             "SELECT DISTINCT codigo_autorizacion, tx_hash FROM splits"
         )
         split_rows = cur.fetchall()
-    finally:
-        cur.close()
 
     cls_by_cod = {r["codigo_autorizacion"]: r for r in cls_rows if r["codigo_autorizacion"]}
     cls_by_hash = {r["tx_hash"]: r for r in cls_rows if r["tx_hash"]}
@@ -131,8 +127,7 @@ def expand_splits(df: pd.DataFrame, conn: psycopg2.extensions.connection) -> pd.
     if "is_split" not in df.columns or not df["is_split"].any():
         return df
 
-    cur = conn.cursor()
-    try:
+    with read_cursor(conn) as cur:
         cur.execute(
             """
             SELECT s.codigo_autorizacion, s.tx_hash, s.categoria_id, s.monto,
@@ -142,8 +137,6 @@ def expand_splits(df: pd.DataFrame, conn: psycopg2.extensions.connection) -> pd.
             """
         )
         rows = cur.fetchall()
-    finally:
-        cur.close()
 
     if not rows:
         return df

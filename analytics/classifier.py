@@ -2,6 +2,7 @@
 from typing import Optional
 import psycopg2.extensions
 
+from .db import read_cursor
 from .repository import upsert_clasificacion
 
 # Mapeo rubro del banco → nombre de categoría (para seed inicial)
@@ -44,8 +45,7 @@ def sugerir_categoria(
     Retorna lista de (categoria_id, nombre, confianza) ordenada por confianza desc.
     confianza = frecuencia / total para ese comercio.
     """
-    cur = conn.cursor()
-    try:
+    with read_cursor(conn) as cur:
         cur.execute(
             """
             SELECT r.categoria_id, c.nombre,
@@ -59,8 +59,6 @@ def sugerir_categoria(
             (comercio,),
         )
         rows = cur.fetchall()
-    finally:
-        cur.close()
     return [(r["categoria_id"], r["nombre"], round(float(r["confianza"]), 2)) for r in rows]
 
 
@@ -101,12 +99,9 @@ def aplicar_seed_desde_rubro(conn: psycopg2.extensions.connection, df) -> int:
     Solo aplica origen='auto'. Retorna número de clasificaciones aplicadas.
     """
     # Obtener mapa nombre_categoria → id
-    cur = conn.cursor()
-    try:
+    with read_cursor(conn) as cur:
         cur.execute("SELECT id, nombre FROM categorias WHERE activa = TRUE")
         rows = cur.fetchall()
-    finally:
-        cur.close()
     cat_map = {r["nombre"]: r["id"] for r in rows}
 
     count = 0

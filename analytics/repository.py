@@ -2,6 +2,7 @@
 from typing import Optional
 import pandas as pd
 import psycopg2.extensions
+from .db import read_cursor
 
 from .models import Categoria, Presupuesto
 
@@ -13,12 +14,9 @@ def get_categorias(conn: psycopg2.extensions.connection, solo_activas: bool = Tr
     if solo_activas:
         q += " WHERE activa = TRUE"
     q += " ORDER BY nombre"
-    cur = conn.cursor()
-    try:
+    with read_cursor(conn) as cur:
         cur.execute(q)
         rows = cur.fetchall()
-    finally:
-        cur.close()
     return [Categoria(id=r["id"], nombre=r["nombre"], color=r["color"], activa=bool(r["activa"])) for r in rows]
 
 
@@ -76,22 +74,18 @@ def delete_categoria(conn: psycopg2.extensions.connection, categoria_id: int) ->
 # ── Presupuestos ──────────────────────────────────────────────────────────────
 
 def get_presupuesto(conn: psycopg2.extensions.connection, categoria_id: int, periodo: str) -> float:
-    cur = conn.cursor()
-    try:
+    with read_cursor(conn) as cur:
         cur.execute(
             "SELECT monto FROM presupuestos WHERE categoria_id = %s AND periodo = %s",
             (categoria_id, periodo),
         )
         row = cur.fetchone()
         return float(row["monto"]) if row else 0.0
-    finally:
-        cur.close()
 
 
 def get_presupuestos_periodo(conn: psycopg2.extensions.connection, periodo: str) -> pd.DataFrame:
     """Retorna DataFrame con (categoria_id, nombre, color, monto_presupuesto)."""
-    cur = conn.cursor()
-    try:
+    with read_cursor(conn) as cur:
         cur.execute(
             """
             SELECT c.id AS categoria_id, c.nombre, c.color,
@@ -104,8 +98,6 @@ def get_presupuestos_periodo(conn: psycopg2.extensions.connection, periodo: str)
             (periodo,),
         )
         rows = cur.fetchall()
-    finally:
-        cur.close()
     df = pd.DataFrame([dict(r) for r in rows])
     df["monto_presupuesto"] = pd.to_numeric(df["monto_presupuesto"], errors="coerce").fillna(0.0)
     return df
@@ -155,8 +147,7 @@ def copiar_presupuesto(conn: psycopg2.extensions.connection, periodo_origen: str
 
 def get_clasificacion(conn: psycopg2.extensions.connection, codigo_autorizacion: Optional[str], tx_hash: Optional[str]) -> Optional[int]:
     """Retorna categoria_id o None."""
-    cur = conn.cursor()
-    try:
+    with read_cursor(conn) as cur:
         if codigo_autorizacion:
             cur.execute(
                 "SELECT categoria_id FROM clasificaciones WHERE codigo_autorizacion = %s",
@@ -174,8 +165,6 @@ def get_clasificacion(conn: psycopg2.extensions.connection, codigo_autorizacion:
             if row:
                 return row["categoria_id"]
         return None
-    finally:
-        cur.close()
 
 
 def delete_clasificacion(
@@ -254,8 +243,7 @@ def get_splits(
     tx_hash: Optional[str] = None,
 ) -> list[dict]:
     """Retorna lista de {categoria_id, categoria_nombre, color, monto} para una transacción."""
-    cur = conn.cursor()
-    try:
+    with read_cursor(conn) as cur:
         if codigo_autorizacion:
             cur.execute(
                 """
@@ -278,8 +266,6 @@ def get_splits(
         else:
             return []
         return [dict(r) for r in cur.fetchall()]
-    finally:
-        cur.close()
 
 
 def upsert_splits(

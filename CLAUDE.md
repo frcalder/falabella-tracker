@@ -184,6 +184,7 @@ tail of every cycle used to be lost permanently. `backfill_period()` recovers it
 - **Dashboard**: Streamlit Cloud (private app), auto-deploys on push to `main`.
 - **Database**: Supabase PostgreSQL (NANO tier, West US Oregon). New projects use IPv6-only direct connection — use Session Pooler (`aws-0-us-west-2.pooler.supabase.com:5432`) for IPv4 compatibility.
 - **Backups**: GitHub Actions (`.github/workflows/backup.yml`), runs daily at 12:00 UTC. Exports all tables to `backups/backup_YYYY-MM-DD.json`, keeps last 7 days. Script: `scripts/backup_db.py`.
+- **DB access model**: nothing in this project uses the Supabase Data API (PostgREST) — scraper, dashboard and backups all connect through `DATABASE_URL` with psycopg2 as the `postgres` role. RLS is enabled with **zero policies** on every table (`analytics/migrations/006_enable_rls.sql`), which locks out the `anon`/`authenticated` API roles; the `postgres` role has `rolbypassrls = TRUE`, so the app is unaffected. When adding a table, enable RLS on it too or the Supabase linter will flag it as publicly accessible.
 
 ## Workflow for bugs and features
 
@@ -201,7 +202,12 @@ tail of every cycle used to be lost permanently. `backfill_period()` recovers it
 ### Feature workflow
 
 1. **Understand before building** — read the files that will be touched. Check if the DB schema needs changes (migrations go in `analytics/migrations/`).
-2. **DB migrations** — add a new `.sql` file in `analytics/migrations/` and apply it in the Supabase SQL Editor (DDL like `CREATE INDEX` and `ALTER TABLE` hits statement timeout through the session pooler — must run from the SQL Editor directly). Update `analytics/schema.sql` to reflect the final state.
+2. **DB migrations** — add a new `.sql` file in `analytics/migrations/` and apply it in the Supabase SQL Editor. Update `analytics/schema.sql` to reflect the final state. **If DDL times out** ("upstream timeout" in the SQL Editor, statement timeout through the pooler), it is usually a *lock* problem, not a slow statement: `ALTER TABLE` needs ACCESS EXCLUSIVE and queues behind any open transaction holding AccessShareLock on the table. Diagnose before retrying:
+   ```sql
+   SELECT pid, usename, application_name, state, now() - xact_start AS tx_abierta, left(query, 60)
+     FROM pg_stat_activity WHERE datname = current_database() AND state = 'idle in transaction';
+   ```
+   Read paths must use `read_cursor()` from `analytics/db.py` precisely so they don't leave such transactions open; a raw `conn.cursor()` read that never commits will block every future migration.
 3. **Code** — implement in the relevant layer (scraper, loader, repository, dashboard page).
 4. **Test locally** — run `pipenv run python main.py --mode scraper --limit 1` to test scraper changes. Run `pipenv run streamlit run dashboard/visualizer.py` for dashboard changes.
 5. **Commit, mirror, document** — same as steps 6–8 of the bug workflow.

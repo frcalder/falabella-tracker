@@ -8,7 +8,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from analytics.db import get_connection, init_db
+from analytics.db import get_connection, init_db, read_cursor
 
 GITHUB_REPO     = "frcalder/gastos-falabella"
 GITHUB_WORKFLOW = "scraper.yml"
@@ -22,8 +22,7 @@ def get_db():
 
 
 def load_runs(conn) -> pd.DataFrame:
-    cur = conn.cursor()
-    try:
+    with read_cursor(conn) as cur:
         cur.execute(
             """
             SELECT id, started_at, finished_at, status, headless,
@@ -35,8 +34,6 @@ def load_runs(conn) -> pd.DataFrame:
             """
         )
         rows = cur.fetchall()
-    finally:
-        cur.close()
     return pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
 
 
