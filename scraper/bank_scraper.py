@@ -1501,7 +1501,7 @@ class FalabellaScraper:
                 objetivo.setdefault(c[0], []).append((c[1], c[3]))
             ultima_pagina = max(objetivo)
 
-            insertadas = 0
+            insertadas, salteadas = 0, 0
             page_num = 0
             self._in_backfill = True
             try:
@@ -1514,6 +1514,7 @@ class FalabellaScraper:
                                 f"  fila {idx} de la página {page_num} no coincide con la "
                                 f"fase 1 — salteada"
                             )
+                            salteadas += 1
                             continue
                         detail = await self._open_and_read_detail(page, idx)
                         detail.pop("modal_cuotas", None)
@@ -1553,6 +1554,14 @@ class FalabellaScraper:
             self._report_backfill_dupes()
             await self._reconcile_log(page, periodo, label)
             logger.info(f"backfill {periodo}: {insertadas} filas insertadas")
+            if salteadas:
+                # Quedó al menos una fila sin escribir: el período NO está completo, así que no
+                # se marca. La corrida de mañana reintenta y, por ser insert-only, no duplica.
+                logger.warning(
+                    f"backfill {periodo}: {salteadas} filas quedaron sin escribir — el período "
+                    f"no se marca y se reintenta en la próxima corrida"
+                )
+                return -1
             return insertadas
         finally:
             self.row_selector = saved_selector
