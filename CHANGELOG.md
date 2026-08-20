@@ -1,5 +1,71 @@
 # Changelog
 
+## 2026-08-20 (2)
+
+### Feature: backfill del período facturado
+
+**Problema:** El scraper leía una sola vista, la pestaña "Últimos movimientos", que muestra el ciclo **abierto**. Cuando el ciclo cierra (el 19), las compras que todavía estaban `pendiente` desaparecen de esa pestaña — y `_reset_pending()` ya las había borrado con un `DELETE FROM movimientos WHERE pendiente = TRUE` sin filtro. Nada las volvía a insertar: **se perdían para siempre**, la cola de cada ciclo, todos los meses. En la instalación de referencia el período `2026-07` tenía 91 filas y `max(fecha) = 18/07`, contra las **97 filas** que el banco lista en el estado de cuenta del 19/07/2026.
+
+**Fix:** un segundo pase que, cuando el ciclo cerró, entra a "Movimientos facturados", lee el estado de cuenta del período recién cerrado y completa lo que falte.
+
+**El detalle se publica con atraso.** El estado de cuenta recién cerrado muestra `Monto facturado` pero la tabla dice *"Aún no tienes movimientos en tu tarjeta"* durante varios días. Por eso el disparador es un **reintento diario**: cada corrida mira si el detalle está publicado y **la marca de idempotencia se escribe solo si el pase leyó filas**. Sin esa regla la primera corrida post-cierre marcaría el período como hecho leyendo cero filas, y la feature perdería el mes entero todos los meses. Hay un tercer estado, distinto del vacío: `error_carga` ("No pudimos cargar tus movimientos facturados"), que se maneja usando el botón **Reintentar** del propio banco hasta 3 veces.
+
+**Cómo funciona (`scraper/bank_scraper.py`):**
+- `backfill_period()` corre **después** del pase normal, así que un fallo del backfill no cuesta el scrape del día, y `_reset_pending()` sigue corriendo una sola vez.
+- Reusa el loop existente sobrescribiendo `self.row_selector`: la pestaña de facturados es otro componente (`app-invoiced-movements`) pero por dentro usa el **mismo `app-movements-table`**, así que las seis columnas caen en los mismos índices y `_read_row` sirve sin cambios. El selector se restaura en un `finally`; `navigate_to_movements` sigue esperando el selector por defecto.
+- **Dos fases**: la primera pagina leyendo solo celdas de tabla (sin abrir un solo modal) y calcula el diff — eso es también el dry-run gratis. La segunda vuelve a la página 1 y abre el modal únicamente de las filas faltantes.
+- Período objetivo derivado del label `Próxima facturación` **menos un mes**: el valor cambia justo cuando el banco rota el label, que *es* la definición de "el ciclo cerró". Sin aritmética de fechas ni zonas horarias.
+- `--backfill-periodo YYYY-MM` fuerza un período (el banco ofrece los **últimos 12 estados de cuenta**) y `--backfill-dry-run` lista lo que falta sin escribir. También como `workflow_dispatch.inputs` y en el expander "Opciones avanzadas" de la página Scraper.
+
+**La misma cuota se llama distinto en cada pestaña.** El hallazgo que el dry-run destapó y que ninguna guarda numérica habría atrapado: "Últimos movimientos" muestra `COMPRA CUOTAS SIN INTERES MERCADO PAGO` y "Movimientos facturados" muestra `COMPRA EN CUOTAS MERCADO PAGO` — **y la fecha difiere en un día** (DB `2025-10-06` vs facturados `07/10/2025`). La clave natural `(fecha, descripcion, monto, num_cuotas)` no puede matchearlas, así que 7 cuotas que ya estaban guardadas aparecían como "faltantes". Con 87% de solape y 13 candidatas, el pase pasaba las dos guardas numéricas y habría reescrito 7 filas correctas. Dos defensas:
+- `_alias_key()` — `(descripción sin el prefijo de cuotas, monto, num_cuotas)`, acotada al período.
+- **Guarda dura por auth code**: antes de escribir, si `(codigo_autorizacion, num_cuotas)` ya existe en el período, la fila no se toca. Es la llave única real de la tabla, y las filas facturadas **sí** traen auth code.
+
+**Otras guardas:**
+- Se fuerza `pendiente = False` en el pase de facturados. Un estado de cuenta no tiene pendientes; si el modal fallara, la cascada de detección marcaría pendiente, el reset del día siguiente borraría la fila y el período ya estaría marcado como hecho — pérdida silenciosa y permanente. Además `_reset_pending()` ahora excluye `backfill_run_id IS NOT NULL`.
+- Solape mínimo del 50% sobre el set completo de filas: si la vista cambia de formato y las claves dejan de matchear, aborta sin escribir. Tope de 25 filas nuevas por pase.
+- Se descarta (y se loguea) toda fila en cuotas sin `Cuota a pagar`: `monto_periodo` caería al monto total de la compra e inflaría el período.
+- **`_upsert_to_db`: el `DELETE` del huérfano por `tx_hash` ahora está acotado por período.** Todas las cuotas de una compra comparten `tx_hash`, así que sin el filtro un backfill de un mes viejo borraría filas de los meses posteriores de la misma compra. **Esto también tapa un bug latente del pase normal**, que podía borrar la cuota de un período anterior al procesar la del siguiente con auth code recién disponible.
+- La reconciliación contra `Monto facturado` es **solo log**: pagos y reversas rompen la igualdad legítimamente (un período con un pago grande puede sumar negativo).
+
+**Migración:** aplicar `analytics/migrations/007_backfill_facturados.sql` en el SQL Editor de Supabase — agrega `scraper_runs.backfill_periodo` (marca de idempotencia) y `movimientos.backfill_run_id` + índice parcial (procedencia, para revertir con exactitud). Los dos `ALTER` son metadata-only; si el statement queda colgado no es lentitud, es un lock (ver la query de `pg_stat_activity` en `CLAUDE.md`).
+
+**Recuperar los meses con hueco.** Si venís usando el scraper desde antes, es muy probable que te falte la cola de cada ciclo cerrado. Verificá el hueco:
+
+```sql
+-- ¿hasta qué día llegó cada período? Un max(fecha) varios días antes del 19 es el síntoma.
+SELECT periodo, count(*) filas, min(fecha) f_min, max(fecha) f_max
+  FROM movimientos GROUP BY periodo ORDER BY periodo DESC;
+```
+
+Y recuperá período por período, **con dry-run primero** y leyendo la lista de candidatas antes de escribir:
+
+```bash
+python main.py --mode scraper --headless --backfill-periodo 2026-07 --backfill-dry-run
+python main.py --mode scraper --headless --backfill-periodo 2026-07
+```
+
+El banco ofrece los últimos 12 estados de cuenta, así que se puede recuperar hasta un año atrás. Después de cada corrida conviene revisar que no se movió ningún otro período:
+
+```sql
+SELECT periodo, count(*), coalesce(sum(monto_periodo),0) FROM movimientos GROUP BY 1 ORDER BY 1 DESC;
+SELECT codigo_autorizacion, num_cuotas, array_agg(DISTINCT periodo)
+  FROM movimientos WHERE codigo_autorizacion IS NOT NULL
+ GROUP BY 1,2 HAVING count(DISTINCT periodo) > 1;   -- debe dar 0 filas
+```
+
+**Revertir un backfill:**
+
+```sql
+SELECT id, fecha, descripcion, monto, num_cuotas, codigo_autorizacion, tx_hash, periodo
+  FROM movimientos WHERE backfill_run_id = :run_id ORDER BY fecha;   -- mirar primero
+DELETE FROM movimientos WHERE backfill_run_id = :run_id;
+UPDATE scraper_runs SET backfill_periodo = NULL WHERE id = :run_id;  -- libera la marca
+```
+
+**Sin limpieza de datos:** el pase es insert-only sobre las filas que faltan; las que ya estaban no se tocan.
+
+
 ## 2026-08-20
 
 ### Fix: el sitio público migró a Next.js y el login del scraper quedó roto

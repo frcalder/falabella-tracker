@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS movimientos (
     num_cuotas          TEXT,
     valor_cuota         NUMERIC,
     tx_hash             TEXT,
+    backfill_run_id     INTEGER,
     created_at          TIMESTAMP DEFAULT NOW(),
     updated_at          TIMESTAMP DEFAULT NOW(),
     UNIQUE (codigo_autorizacion, num_cuotas)
@@ -82,7 +83,8 @@ CREATE TABLE IF NOT EXISTS scraper_runs (
     actualizados    INTEGER DEFAULT 0,
     pendientes      INTEGER DEFAULT 0,
     error_message   TEXT,
-    periodo         TEXT
+    periodo         TEXT,
+    backfill_periodo TEXT
 );
 
 CREATE TABLE IF NOT EXISTS splits (
@@ -98,6 +100,8 @@ CREATE TABLE IF NOT EXISTS splits (
 -- Índices recomendados para queries frecuentes
 CREATE INDEX IF NOT EXISTS idx_movimientos_periodo      ON movimientos(periodo);
 CREATE INDEX IF NOT EXISTS idx_movimientos_pendiente    ON movimientos(pendiente);
+CREATE INDEX IF NOT EXISTS idx_movimientos_backfill_run
+    ON movimientos (backfill_run_id) WHERE backfill_run_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_movimientos_fecha        ON movimientos(fecha);
 CREATE INDEX IF NOT EXISTS idx_clasificaciones_cod_aut  ON clasificaciones(codigo_autorizacion);
 CREATE INDEX IF NOT EXISTS idx_clasificaciones_tx_hash  ON clasificaciones(tx_hash);

@@ -218,6 +218,94 @@ JS_NEXT_PAGE_RECT = """
 
 DATE_RE = re.compile(r"^\d{2}/\d{2}/\d{4}$")
 
+# ------------------------------------------------------------------ #
+# Pestaña "Movimientos facturados" (estados de cuenta cerrados)        #
+# ------------------------------------------------------------------ #
+
+# Helpers compartidos: la app vive detrás de shadow roots, así que hay que traversarlos.
+_JS_WALK = """
+    const find = (pred) => {
+        const out = [];
+        (function walk(root) {
+            for (const el of root.querySelectorAll('*')) {
+                if (pred(el)) out.push(el);
+                if (el.shadowRoot) walk(el.shadowRoot);
+            }
+        })(document);
+        return out;
+    };
+    const q = (sel) => {
+        const out = [];
+        (function walk(root) {
+            try { out.push(...root.querySelectorAll(sel)); } catch (e) {}
+            for (const el of root.querySelectorAll('*')) if (el.shadowRoot) walk(el.shadowRoot);
+        })(document);
+        return out;
+    };
+"""
+
+JS_CLICK_BILLED_TAB = """
+(label) => {
+""" + _JS_WALK + """
+    const tabs = find(el => el.tagName === 'LABEL' && el.textContent.trim() === label);
+    if (!tabs.length) return false;
+    tabs[0].click();
+    return true;
+}
+"""
+
+# Tres estados distintos, y la diferencia importa:
+#   con_filas    → hay detalle, se puede leer
+#   sin_detalle  → "Aún no tienes movimientos": el banco todavía no publicó el estado de cuenta
+#                  (normal los primeros días tras el cierre) → NO marcar, reintentar mañana
+#   error_carga  → "No pudimos cargar...": falla del backend, hay botón Reintentar
+JS_BILLED_STATE = """
+() => {
+""" + _JS_WALK + """
+    const inv = find(el => el.tagName === 'APP-INVOICED-MOVEMENTS')[0];
+    if (!inv) return 'sin_pestana';
+    if (q('app-invoiced-movements table tbody tr').length) return 'con_filas';
+    const txt = inv.textContent.replace(/\\s+/g, ' ');
+    if (/No pudimos cargar/i.test(txt)) return 'error_carga';
+    if (/no tienes movimientos/i.test(txt)) return 'sin_detalle';
+    return 'cargando';
+}
+"""
+
+JS_CLICK_BILLED_RETRY = """
+() => {
+""" + _JS_WALK + """
+    const btns = find(el => el.tagName === 'BUTTON' && el.textContent.trim() === 'Reintentar');
+    if (!btns.length) return false;
+    btns[0].click();
+    return true;
+}
+"""
+
+# El header no se actualiza al cambiar de estado de cuenta en el dropdown, así que su fecha se
+# usa solo para validar: si no coincide con el período pedido, se ignora el monto.
+JS_BILLED_HEADER = """
+() => {
+""" + _JS_WALK + """
+    const inv = find(el => el.tagName === 'APP-INVOICED-MOVEMENTS')[0];
+    if (!inv) return null;
+    const txt = inv.textContent.replace(/\\s+/g, ' ');
+    const fecha = txt.match(/Fecha de facturaci[oó]n\\s*(\\d{2}\\/\\d{2}\\/\\d{4})/i);
+    const monto = txt.match(/Monto facturado\\s*\\$?\\s*([\\d.,]+)/i);
+    return { fecha_facturacion: fecha ? fecha[1] : '', monto_facturado: monto ? monto[1] : '' };
+}
+"""
+
+JS_BILLED_LOADING = """
+() => {
+""" + _JS_WALK + """
+    return find(el => el.tagName === 'APP-LOADER').some(el => el.getClientRects().length > 0);
+}
+"""
+
+BILLED_STATEMENT_SELECT = 'select[name="dateOnChange"]'
+
+
 
 def _parse_monto(s: str) -> Optional[float]:
     """Convierte '$ -1.234' o '-$3.712.410' a float preservando el signo."""
@@ -249,6 +337,11 @@ def _make_tx_hash(fecha_compra_raw: str, descripcion: str, monto_raw: str) -> st
 
 class FalabellaScraper:
     ROW_SELECTOR = "app-last-movements table tbody tr"
+    # Pestaña "Movimientos facturados": otro componente Angular, pero por dentro usa el mismo
+    # `app-movements-table` que la vista de últimos movimientos, así que las seis columnas caen
+    # en los mismos índices y `_read_row` sirve sin cambios.
+    BILLED_ROW_SELECTOR = "app-invoiced-movements table tbody tr"
+    BILLED_TAB_LABEL = "Movimientos facturados"
 
     def __init__(self, headless: bool = False, debug_mode: bool = False):
         self.username = os.getenv("FALABELLA_USER")
@@ -272,6 +365,13 @@ class FalabellaScraper:
         )
 
         self.periodo_facturacion: str = ""
+        # Selector de filas del pase en curso. El pase de facturados lo sobrescribe y lo restaura.
+        self.row_selector: str = self.ROW_SELECTOR
+        self.backfill_periodo: str = ""      # 'YYYY-MM' forzado por CLI; "" = automático
+        self.backfill_dry_run: bool = False
+        self.backfill_max_new: int = 25      # tope de filas nuevas por pase
+        self.backfill_min_overlap: float = 0.5
+        self._in_backfill: bool = False      # lo lee _upsert_to_db para sellar la procedencia
         self.existing_keys: set = self._load_existing_keys()
         self.incomplete_keys: set = self._load_incomplete_keys()
         self.pending_hashes: dict = {}  # {(desc_norm, monto_norm): tx_hash} — cargado antes de _reset_pending
@@ -455,10 +555,17 @@ class FalabellaScraper:
             return {}
 
     def _reset_pending(self) -> None:
-        """Elimina todos los pendientes de la DB al inicio del run para re-agregarlos frescos."""
+        """Elimina todos los pendientes de la DB al inicio del run para re-agregarlos frescos.
+
+        Excluye las filas escritas por un backfill: un estado de cuenta no tiene pendientes, así
+        que una fila con `backfill_run_id` marcada como pendiente sería un error de detección —
+        y borrarla la perdería para siempre, porque el período ya quedó marcado como completado.
+        """
         try:
             cur = self.db_conn.cursor()
-            cur.execute("DELETE FROM movimientos WHERE pendiente = TRUE")
+            cur.execute(
+                "DELETE FROM movimientos WHERE pendiente = TRUE AND backfill_run_id IS NULL"
+            )
             n = cur.rowcount
             self.db_conn.commit()
             cur.close()
@@ -534,6 +641,10 @@ class FalabellaScraper:
             "num_cuotas": str(movement.get("num_cuotas", "") or "").strip() or None,
             "valor_cuota": valor_cuota,
             "tx_hash": tx_hash,
+            # Procedencia: NULL en el pase normal. Solo se sella al INSERTAR (nunca en el
+            # DO UPDATE), para que el rollback `DELETE ... WHERE backfill_run_id = N` borre
+            # exactamente lo que el backfill creó y no filas que ya existían.
+            "backfill_run_id": self.run_id if self._in_backfill else None,
         }
 
         cur = self.db_conn.cursor()
@@ -544,9 +655,15 @@ class FalabellaScraper:
                 # un run anterior y ahora sí tiene auth code: sin este DELETE quedarían
                 # dos filas para la misma transacción (duplicados).
                 if potential_hash:
+                    # Acotado al período: todas las cuotas de una compra comparten `tx_hash`,
+                    # así que sin el filtro un backfill de un mes viejo —o el pase normal al
+                    # procesar la cuota de un período con auth code recién disponible— borraría
+                    # las filas de los otros períodos de la misma compra.
                     cur.execute(
-                        "DELETE FROM movimientos WHERE tx_hash = %s AND codigo_autorizacion IS NULL",
-                        (potential_hash,),
+                        "DELETE FROM movimientos "
+                        " WHERE tx_hash = %s AND codigo_autorizacion IS NULL"
+                        "   AND periodo IS NOT DISTINCT FROM %s",
+                        (potential_hash, periodo),
                     )
                 cur.execute(
                     """
@@ -554,13 +671,13 @@ class FalabellaScraper:
                         (fecha, descripcion, persona, monto, monto_periodo, pendiente,
                          rubro, comercio, codigo_autorizacion, fecha_compra, hora,
                          pais, origen, periodo_facturacion, periodo, num_cuotas,
-                         valor_cuota, tx_hash, updated_at)
+                         valor_cuota, tx_hash, backfill_run_id, updated_at)
                     VALUES
                         (%(fecha)s, %(descripcion)s, %(persona)s, %(monto)s, %(monto_periodo)s,
                          %(pendiente)s, %(rubro)s, %(comercio)s, %(codigo_autorizacion)s,
                          %(fecha_compra)s, %(hora)s, %(pais)s, %(origen)s,
                          %(periodo_facturacion)s, %(periodo)s, %(num_cuotas)s,
-                         %(valor_cuota)s, %(tx_hash)s, NOW())
+                         %(valor_cuota)s, %(tx_hash)s, %(backfill_run_id)s, NOW())
                     ON CONFLICT (codigo_autorizacion, num_cuotas) DO UPDATE SET
                         fecha             = EXCLUDED.fecha,
                         descripcion       = EXCLUDED.descripcion,
@@ -589,13 +706,13 @@ class FalabellaScraper:
                         (fecha, descripcion, persona, monto, monto_periodo, pendiente,
                          rubro, comercio, codigo_autorizacion, fecha_compra, hora,
                          pais, origen, periodo_facturacion, periodo, num_cuotas,
-                         valor_cuota, tx_hash, updated_at)
+                         valor_cuota, tx_hash, backfill_run_id, updated_at)
                     VALUES
                         (%(fecha)s, %(descripcion)s, %(persona)s, %(monto)s, %(monto_periodo)s,
                          %(pendiente)s, %(rubro)s, %(comercio)s, %(codigo_autorizacion)s,
                          %(fecha_compra)s, %(hora)s, %(pais)s, %(origen)s,
                          %(periodo_facturacion)s, %(periodo)s, %(num_cuotas)s,
-                         %(valor_cuota)s, %(tx_hash)s, NOW())
+                         %(valor_cuota)s, %(tx_hash)s, %(backfill_run_id)s, NOW())
                     ON CONFLICT (tx_hash, periodo) WHERE tx_hash IS NOT NULL DO UPDATE SET
                         fecha             = EXCLUDED.fecha,
                         descripcion       = EXCLUDED.descripcion,
@@ -919,6 +1036,8 @@ class FalabellaScraper:
                 await card_link.evaluate("el => el.click()")
 
         try:
+            # Siempre la pestaña por defecto: el override de `row_selector` del pase de
+            # facturados no debe afectar la navegación inicial.
             await page.wait_for_selector(self.ROW_SELECTOR, timeout=30000)
             logger.info("Tabla cargada")
             await self._screenshot(page, "movements_loaded")
@@ -957,14 +1076,496 @@ class FalabellaScraper:
         """)
 
     # ------------------------------------------------------------------ #
+    # Backfill del período facturado                                       #
+    # ------------------------------------------------------------------ #
+
+    def _closed_periodo(self) -> Optional[str]:
+        """'YYYY-MM' del período recién cerrado, derivado de 'Próxima facturación' menos un mes.
+
+        Se deriva del label del banco y no del reloj: el valor cambia justo cuando el banco rota
+        la fecha de próxima facturación, que *es* la definición de "el ciclo cerró". Sin
+        aritmética de fechas ni zonas horarias.
+        """
+        d = _parse_date(self.periodo_facturacion)
+        if not d:
+            return None
+        y, m = (d.year, d.month - 1) if d.month > 1 else (d.year - 1, 12)
+        return f"{y:04d}-{m:02d}"
+
+    def _backfill_done(self, periodo: str) -> Optional[bool]:
+        """True = ya se completó, False = falta, None = no se pudo determinar.
+
+        None significa **no hacer nada**: si no se puede leer la marca (por ejemplo porque falta
+        la migración 007), correr el pase a ciegas lo repetiría en cada corrida.
+        """
+        cur = self.db_conn.cursor()
+        try:
+            cur.execute(
+                "SELECT 1 FROM scraper_runs "
+                " WHERE backfill_periodo = %s AND status = 'success' LIMIT 1",
+                (periodo,),
+            )
+            return cur.fetchone() is not None
+        except Exception as e:
+            logger.warning(f"No se pudo leer la marca de backfill ({e}) — se omite el pase")
+            return None
+        finally:
+            cur.close()
+            self.db_conn.rollback()
+
+    def _mark_backfill_done(self, periodo: str) -> None:
+        if not self.run_id:
+            return
+        cur = self.db_conn.cursor()
+        try:
+            cur.execute(
+                "UPDATE scraper_runs SET backfill_periodo = %s WHERE id = %s",
+                (periodo, self.run_id),
+            )
+            self.db_conn.commit()
+            logger.info(f"Período {periodo} marcado como completado desde facturados")
+        except Exception as e:
+            self.db_conn.rollback()
+            logger.warning(f"No se pudo marcar el backfill de {periodo}: {e}")
+        finally:
+            cur.close()
+
+    @staticmethod
+    def _desc_alias(descripcion: str) -> str:
+        """Descripción normalizada, sin el prefijo de cuotas.
+
+        La misma cuota se llama distinto según la pestaña: "Últimos movimientos" la muestra como
+        `COMPRA CUOTAS SIN INTERES MERCADO PAGO` y "Movimientos facturados" como
+        `COMPRA EN CUOTAS MERCADO PAGO`. Además la fecha difiere en un día entre las dos vistas,
+        así que la clave natural `(fecha, descripcion, monto, cuotas)` no puede matchearlas.
+        """
+        d = " ".join(str(descripcion or "").rstrip("*").strip().upper().split())
+        for prefijo in ("COMPRA CUOTAS SIN INTERES ", "COMPRA EN CUOTAS "):
+            if d.startswith(prefijo):
+                return d[len(prefijo):]
+        return d
+
+    def _alias_key(self, movement: Dict[str, Any]) -> tuple:
+        """Clave tolerante a la diferencia de descripción y fecha entre las dos pestañas:
+        (descripción sin prefijo de cuotas, monto, cuotas). Se usa solo dentro de un período,
+        y solo para NO insertar — nunca para escribir."""
+        monto_norm = str(int(abs(_parse_monto(str(movement.get("monto", "") or "")) or 0)))
+        cuotas = str(movement.get("num_cuotas", "") or "").strip()
+        return (self._desc_alias(movement.get("descripcion", "")), monto_norm, cuotas)
+
+    def _load_period_index(self, periodo: str) -> tuple:
+        """(auth_keys, alias_keys) de un período: la identidad que ya está guardada.
+
+        `auth_keys` es la llave única real de la tabla `(codigo_autorizacion, num_cuotas)` y es la
+        guarda dura antes de escribir. `alias_keys` es la tolerante, para clasificar bien las
+        candidatas en el reporte y no abrir modales al vacío.
+        """
+        auth_keys, alias_keys = set(), set()
+        cur = self.db_conn.cursor()
+        try:
+            cur.execute(
+                "SELECT descripcion, monto, num_cuotas, codigo_autorizacion "
+                "  FROM movimientos WHERE periodo = %s",
+                (periodo,),
+            )
+            for r in cur.fetchall():
+                cuotas = str(r["num_cuotas"] or "").strip()
+                if r["codigo_autorizacion"]:
+                    auth_keys.add((self._normalize_auth(r["codigo_autorizacion"]), cuotas))
+                monto_norm = str(int(abs(float(r["monto"] or 0))))
+                alias_keys.add((self._desc_alias(r["descripcion"]), monto_norm, cuotas))
+        except Exception as e:
+            logger.warning(f"No se pudo indexar el período {periodo}: {e}")
+        finally:
+            cur.close()
+            self.db_conn.rollback()
+        return auth_keys, alias_keys
+
+    def _backfill_row_ok(self, movement: Dict[str, Any]) -> tuple:
+        """(ok, motivo) — filtros de sanidad sobre una fila del estado de cuenta."""
+        if not DATE_RE.match(str(movement.get("fecha", "") or "")):
+            return False, "sin fecha en la tabla"
+        cuotas = str(movement.get("num_cuotas", "") or "").strip()
+        en_cuotas = cuotas not in ("", "01/01", "01 de 01", "/")
+        if en_cuotas and not str(movement.get("valor_cuota", "") or "").strip():
+            # monto_periodo caería al monto total de la compra e inflaría el período.
+            return False, f"cuota {cuotas} sin 'Cuota a pagar'"
+        return True, ""
+
+    async def _billed_wait_load(self, page: Page, gone_tries: int = 25) -> None:
+        """Espera el ciclo de carga del componente: loader visible → loader oculto.
+
+        Hace falta porque al cambiar de estado de cuenta el DOM del anterior sigue montado unos
+        segundos: leer el estado antes de que arranque la carga devuelve el resultado viejo.
+        """
+        for _ in range(12):  # hasta 6s a que ARRANQUE la carga
+            if await page.evaluate(JS_BILLED_LOADING):
+                break
+            await page.wait_for_timeout(500)
+        for _ in range(gone_tries):  # hasta 50s a que TERMINE
+            if not await page.evaluate(JS_BILLED_LOADING):
+                return
+            await page.wait_for_timeout(2000)
+
+    async def _billed_state(self, page: Page, tries: int = 25, confirm: int = 3) -> str:
+        """Estado de la vista. `con_filas` se acepta al toque; un estado vacío o de error hay
+        que verlo `confirm` veces seguidas para creerlo (evita leer el render anterior)."""
+        state, repetido, previo = "cargando", 0, ""
+        for _ in range(tries):
+            state = await page.evaluate(JS_BILLED_STATE)
+            if state == "con_filas":
+                return state
+            repetido = repetido + 1 if state == previo else 1
+            previo = state
+            if state != "cargando" and repetido >= confirm:
+                return state
+            await page.wait_for_timeout(2000)
+        return state
+
+    async def _billed_settle(self, page: Page, retries: int = 3) -> str:
+        """Estado final de la vista, usando el botón Reintentar del banco si la carga falló."""
+        state = await self._billed_state(page)
+        for i in range(retries):
+            if state != "error_carga":
+                break
+            logger.info(f"La vista de facturados falló al cargar — Reintentar ({i + 1}/{retries})")
+            if not await page.evaluate(JS_CLICK_BILLED_RETRY):
+                break
+            await page.wait_for_timeout(4000)
+            state = await self._billed_state(page)
+        return state
+
+    async def _open_billed_tab(self, page: Page) -> bool:
+        if not await page.evaluate(JS_CLICK_BILLED_TAB, self.BILLED_TAB_LABEL):
+            logger.error(f"No se encontró la pestaña '{self.BILLED_TAB_LABEL}'")
+            return False
+        # El componente monta el dropdown de estados de cuenta unos segundos después del click;
+        # leer las opciones antes devuelve una lista vacía.
+        try:
+            await page.locator(BILLED_STATEMENT_SELECT).first.wait_for(
+                state="attached", timeout=30000
+            )
+        except Exception:
+            logger.error("La pestaña de facturados no montó el selector de estados de cuenta")
+            await self._screenshot(page, "backfill_sin_selector", error=True)
+            return False
+        return True
+
+    async def _billed_statements(self, page: Page) -> List[str]:
+        """Etiquetas 'dd/mm/yyyy' de los estados de cuenta que ofrece el dropdown."""
+        try:
+            opts = await page.locator(f"{BILLED_STATEMENT_SELECT} option").all_text_contents()
+        except Exception:
+            return []
+        return [o.strip() for o in opts if o.strip()]
+
+    async def _billed_statements_ready(self, page: Page, tries: int = 15) -> List[str]:
+        """Igual que `_billed_statements`, pero espera a que el dropdown termine de poblarse.
+
+        El componente lo monta en dos etapas: primero con el estado de cuenta vigente como única
+        opción, y unos segundos después con los 12 que ofrece el banco. Leerlo antes daría una
+        lista de un solo elemento y el período pedido parecería no existir.
+        """
+        previa: List[str] = []
+        for _ in range(tries):
+            actual = await self._billed_statements(page)
+            if len(actual) > 1 and actual == previa:
+                return actual
+            previa = actual
+            await page.wait_for_timeout(1000)
+        return previa
+
+    async def _load_statement(self, page: Page, label: str, force_reload: bool = False) -> str:
+        """Selecciona un estado de cuenta y devuelve el estado final de la vista."""
+        sel = page.locator(BILLED_STATEMENT_SELECT)
+        if force_reload:
+            # select_option no dispara la recarga si el valor no cambia, y hace falta volver a
+            # la página 1 para la fase 2: se pasa por otro estado de cuenta y se vuelve.
+            otros = [l for l in await self._billed_statements_ready(page) if l != label]
+            if otros:
+                await sel.select_option(label=otros[0])
+                await self._billed_wait_load(page)
+        await sel.select_option(label=label)
+        await self._billed_wait_load(page)
+        state = await self._billed_settle(page)
+
+        d = _parse_date(label)
+        value = await sel.input_value()
+        if not d or not str(value).startswith(d.strftime("%Y-%m-%d")):
+            logger.error(f"No quedó seleccionado el estado de cuenta {label} (select={value})")
+            return "seleccion_fallida"
+        return state
+
+    async def _billed_collect(self, page: Page) -> List[tuple]:
+        """Fase 1: recorre las páginas leyendo SOLO celdas de tabla. No abre modales ni escribe.
+
+        Devuelve [(nro_pagina, indice_fila, movimiento, clave), ...].
+        """
+        collected: List[tuple] = []
+        page_num, prev_sig = 0, ""
+        while True:
+            page_num += 1
+            total = await self._count_rows(page)
+            sig = (
+                await page.locator(self.row_selector).nth(0).inner_text() if total else ""
+            )
+            if sig and sig == prev_sig:
+                logger.info("  Página repetida — fin del recorrido")
+                break
+            prev_sig = sig
+
+            leidas = 0
+            for i in range(total):
+                mv = await self._read_row(page, i)
+                if not mv.get("descripcion", "").strip() and not mv.get("monto", "").strip():
+                    continue
+                collected.append((page_num, i, mv, self._movement_key(mv)))
+                leidas += 1
+            logger.info(f"  Página {page_num}: {leidas} filas")
+
+            if not await self._has_next_page(page):
+                break
+            await self._go_next_page(page)
+        return collected
+
+    async def _reconcile_log(self, page: Page, periodo: str, label: str) -> None:
+        """Loguea el total del banco contra el de la DB. Nunca corta la corrida: pagos y
+        reversas hacen que la igualdad se rompa legítimamente."""
+        header = await page.evaluate(JS_BILLED_HEADER) or {}
+        cur = self.db_conn.cursor()
+        try:
+            cur.execute(
+                "SELECT count(*) n, coalesce(sum(monto_periodo), 0) neto, "
+                "       coalesce(sum(monto_periodo) FILTER (WHERE monto_periodo > 0), 0) cargos "
+                "  FROM movimientos WHERE periodo = %s",
+                (periodo,),
+            )
+            row = cur.fetchone() or {}
+            msg = (f"Reconciliación {periodo}: DB {row.get('n')} filas, "
+                   f"cargos {row.get('cargos')}, neto {row.get('neto')}")
+            if header.get("fecha_facturacion") == label and header.get("monto_facturado"):
+                msg += f" — banco informa monto facturado {header['monto_facturado']}"
+            logger.info(msg)
+        except Exception as e:
+            logger.warning(f"No se pudo reconciliar {periodo}: {e}")
+        finally:
+            cur.close()
+            self.db_conn.rollback()
+
+    def _report_backfill_dupes(self) -> None:
+        """Detecta (sin borrar) posibles duplicados: un pendiente que coincide en descripción y
+        monto con una fila recién insertada. Es el hueco residual del camino por tx_hash."""
+        if not self.run_id:
+            return
+        cur = self.db_conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT b.id AS id_facturado, b.fecha, b.descripcion, b.monto,
+                       p.id AS id_pendiente, p.periodo AS periodo_pendiente
+                  FROM movimientos b
+                  JOIN movimientos p
+                    ON p.pendiente
+                   AND upper(btrim(rtrim(p.descripcion, '*'))) =
+                       upper(btrim(rtrim(b.descripcion, '*')))
+                   AND round(abs(p.monto)) = round(abs(b.monto))
+                 WHERE b.backfill_run_id = %s
+                """,
+                (self.run_id,),
+            )
+            dupes = cur.fetchall()
+            for d in dupes:
+                logger.warning(
+                    "Posible duplicado tras el backfill: facturada id=%s (%s %s) coincide con "
+                    "pendiente id=%s del período %s — revisar a mano",
+                    d["id_facturado"], d["fecha"], d["descripcion"],
+                    d["id_pendiente"], d["periodo_pendiente"],
+                )
+        except Exception as e:
+            logger.warning(f"No se pudo revisar duplicados del backfill: {e}")
+        finally:
+            cur.close()
+            self.db_conn.rollback()
+
+    async def backfill_period(self, page: Page, periodo: str) -> int:
+        """Completa desde "Movimientos facturados" las filas que faltan de un período cerrado.
+
+        Devuelve la cantidad de filas insertadas, o **-1** si no se pudo completar el período
+        (el banco no publicó el detalle todavía, o una guarda abortó el pase). -1 significa
+        *no marcar*: la corrida de mañana reintenta.
+        """
+        if not await self._open_billed_tab(page):
+            return -1
+
+        labels = await self._billed_statements_ready(page)
+        match = [l for l in labels
+                 if (_parse_date(l) and _parse_date(l).strftime("%Y-%m") == periodo)]
+        if not match:
+            logger.warning(
+                f"backfill {periodo}: el banco no ofrece ese estado de cuenta "
+                f"(disponibles: {', '.join(labels) or 'ninguno'})"
+            )
+            return -1
+        label = match[0]
+
+        state = await self._load_statement(page, label)
+        if state == "sin_detalle":
+            logger.info(
+                f"backfill {periodo}: el banco todavía no publicó el detalle del estado de "
+                f"cuenta {label} — se reintenta en la próxima corrida"
+            )
+            return -1
+        if state != "con_filas":
+            logger.warning(f"backfill {periodo}: la vista quedó en estado '{state}'")
+            await self._screenshot(page, f"backfill_{periodo}_{state}", error=True)
+            return -1
+
+        saved_selector = self.row_selector
+        self.row_selector = self.BILLED_ROW_SELECTOR
+        try:
+            logger.info(f"backfill {periodo}: leyendo el estado de cuenta {label}")
+            collected = await self._billed_collect(page)
+            total = len(collected)
+            if total == 0:
+                logger.warning(f"backfill {periodo}: 0 filas leídas")
+                return -1
+
+            auth_keys, alias_keys = self._load_period_index(periodo)
+
+            conocidas = sum(1 for c in collected if c[3] in self.existing_keys)
+            por_alias = [
+                c for c in collected
+                if c[3] not in self.existing_keys and self._alias_key(c[2]) in alias_keys
+            ]
+            solape = (conocidas + len(por_alias)) / total
+            logger.info(
+                f"backfill {periodo}: {total} filas en el estado de cuenta, "
+                f"{conocidas} ya en la DB por clave natural, {len(por_alias)} por descripción "
+                f"alternativa (solape {solape:.0%})"
+            )
+            for c in por_alias:
+                logger.info(
+                    f"  ya está con otra descripción/fecha: {c[2].get('fecha')} | "
+                    f"{c[2].get('descripcion')} | {c[2].get('monto')} | {c[2].get('num_cuotas')}"
+                )
+            if solape < self.backfill_min_overlap:
+                logger.error(
+                    f"backfill {periodo}: solape {solape:.0%} bajo el mínimo "
+                    f"({self.backfill_min_overlap:.0%}) — probablemente la vista cambió de "
+                    f"formato y las claves no matchean. Abortado sin escribir."
+                )
+                return -1
+
+            alias_por_saltar = {(c[0], c[1]) for c in por_alias}
+            candidatas, descartadas = [], []
+            for c in collected:
+                if c[3] in self.existing_keys or (c[0], c[1]) in alias_por_saltar:
+                    continue
+                ok, motivo = self._backfill_row_ok(c[2])
+                (candidatas if ok else descartadas).append((c, motivo))
+            for (c, motivo) in descartadas:
+                logger.warning(
+                    f"  descartada ({motivo}): {c[2].get('fecha')} "
+                    f"{c[2].get('descripcion')} {c[2].get('monto')}"
+                )
+            if not candidatas:
+                logger.info(f"backfill {periodo}: no falta ninguna fila")
+                await self._reconcile_log(page, periodo, label)
+                return 0
+            if len(candidatas) > self.backfill_max_new:
+                logger.error(
+                    f"backfill {periodo}: {len(candidatas)} filas nuevas superan el tope de "
+                    f"{self.backfill_max_new} — abortado sin escribir"
+                )
+                return -1
+
+            logger.info(f"backfill {periodo}: {len(candidatas)} filas faltantes")
+            for (c, _) in candidatas:
+                mv = c[2]
+                logger.info(
+                    f"  falta: {mv.get('fecha')} | {mv.get('descripcion')} | "
+                    f"{mv.get('monto')} | cuotas {mv.get('num_cuotas')} | "
+                    f"cuota a pagar {mv.get('valor_cuota')}"
+                )
+            if self.backfill_dry_run:
+                logger.info(f"backfill {periodo}: dry-run, no se escribió nada")
+                return 0
+
+            # --- fase 2: volver a la página 1 y abrir el modal solo de las faltantes ---
+            if await self._load_statement(page, label, force_reload=True) != "con_filas":
+                logger.error(f"backfill {periodo}: no se pudo recargar el estado de cuenta")
+                return -1
+
+            objetivo: Dict[int, List[tuple]] = {}
+            for (c, _) in candidatas:
+                objetivo.setdefault(c[0], []).append((c[1], c[3]))
+            ultima_pagina = max(objetivo)
+
+            insertadas = 0
+            page_num = 0
+            self._in_backfill = True
+            try:
+                while True:
+                    page_num += 1
+                    for (idx, key) in objetivo.get(page_num, []):
+                        mv = await self._read_row(page, idx)
+                        if self._movement_key(mv) != key:
+                            logger.warning(
+                                f"  fila {idx} de la página {page_num} no coincide con la "
+                                f"fase 1 — salteada"
+                            )
+                            continue
+                        detail = await self._open_and_read_detail(page, idx)
+                        detail.pop("modal_cuotas", None)
+                        mv.update(detail)
+
+                        # Guarda dura: `(codigo_autorizacion, num_cuotas)` es la llave única real
+                        # de la tabla. Si ya está, esta fila es un movimiento que la DB tiene con
+                        # otra descripción o fecha — insertarlo reescribiría la fila buena.
+                        auth = self._normalize_auth(mv.get("codigo_autorizacion", ""))
+                        cuotas = str(mv.get("num_cuotas", "") or "").strip()
+                        if auth and (auth, cuotas) in auth_keys:
+                            logger.info(
+                                f"  = ya existe con auth {auth} cuotas {cuotas} "
+                                f"({mv.get('descripcion')}) — no se toca"
+                            )
+                            continue
+                        # Un estado de cuenta no tiene pendientes: si el modal falló, la cascada
+                        # de extract_all_movements marcaría pendiente y el reset de mañana la
+                        # borraría, con el período ya marcado como hecho.
+                        mv["pendiente"] = False
+                        mv["periodo_facturacion"] = label
+                        self._upsert_to_db(mv)
+                        self.existing_keys.add(self._movement_key(mv))
+                        insertadas += 1
+                        self._cnt_procesados += 1
+                        self._cnt_nuevos += 1
+                        logger.info(
+                            f"  + {mv.get('fecha')} {mv.get('descripcion')} "
+                            f"{mv.get('monto')} (auth={mv.get('codigo_autorizacion') or '∅'})"
+                        )
+                    if page_num >= ultima_pagina or not await self._has_next_page(page):
+                        break
+                    await self._go_next_page(page)
+            finally:
+                self._in_backfill = False
+
+            self._report_backfill_dupes()
+            await self._reconcile_log(page, periodo, label)
+            logger.info(f"backfill {periodo}: {insertadas} filas insertadas")
+            return insertadas
+        finally:
+            self.row_selector = saved_selector
+
+    # ------------------------------------------------------------------ #
     # Filas                                                                #
     # ------------------------------------------------------------------ #
 
     async def _count_rows(self, page: Page) -> int:
-        return await page.locator(self.ROW_SELECTOR).count()
+        return await page.locator(self.row_selector).count()
 
     async def _read_row(self, page: Page, index: int) -> Dict[str, Any]:
-        row = page.locator(self.ROW_SELECTOR).nth(index)
+        row = page.locator(self.row_selector).nth(index)
         cells = await row.locator("td").all()
         texts = [await c.inner_text() for c in cells]
 
@@ -997,7 +1598,7 @@ class FalabellaScraper:
 
     async def _click_row(self, page: Page, index: int) -> bool:
         """Intenta clickear la fila; si está bloqueada cierra el modal y reintenta una vez."""
-        row = page.locator(self.ROW_SELECTOR).nth(index)
+        row = page.locator(self.row_selector).nth(index)
         try:
             await row.click(timeout=8000)
             return True
@@ -1005,7 +1606,7 @@ class FalabellaScraper:
             logger.warning(f"    Fila {index} bloqueada — cerrando modal y reintentando")
             await self._close_modal(page)
         try:
-            row = page.locator(self.ROW_SELECTOR).nth(index)
+            row = page.locator(self.row_selector).nth(index)
             await row.click(timeout=8000)
             return True
         except Exception:
@@ -1084,7 +1685,7 @@ class FalabellaScraper:
             return
 
         # Capturar texto de la primera fila antes de navegar
-        first_before = await page.locator(self.ROW_SELECTOR).nth(0).inner_text()
+        first_before = await page.locator(self.row_selector).nth(0).inner_text()
 
         x, y = rect["x"], rect["y"]
         await page.mouse.click(x, y)
@@ -1093,7 +1694,7 @@ class FalabellaScraper:
         try:
             await page.wait_for_function(
                 f"""() => {{
-                    const row = document.querySelector('{self.ROW_SELECTOR}');
+                    const row = document.querySelector('{self.row_selector}');
                     return row && row.innerText !== {repr(first_before)};
                 }}""",
                 timeout=10000,
@@ -1118,7 +1719,7 @@ class FalabellaScraper:
             logger.info(f"Página {page_num}: {total_rows} movimientos")
 
             # Detectar loop: si la primera fila es igual a la página anterior, salimos
-            first_row_text = await page.locator(self.ROW_SELECTOR).nth(0).inner_text() if total_rows > 0 else ""
+            first_row_text = await page.locator(self.row_selector).nth(0).inner_text() if total_rows > 0 else ""
             if first_row_text and first_row_text == prev_page_signature:
                 logger.info("Página repetida detectada — extracción completa")
                 break
@@ -1199,6 +1800,26 @@ class FalabellaScraper:
     # Run                                                                  #
     # ------------------------------------------------------------------ #
 
+    async def _maybe_backfill(self, page: Page) -> None:
+        """Corre el backfill del período cerrado si corresponde. Nunca hace fallar la corrida."""
+        periodo = self.backfill_periodo
+        forzado = bool(periodo)
+        if not forzado:
+            if self.max_per_page:
+                return  # una corrida truncada por --limit no debe consumir la marca
+            periodo = self._closed_periodo()
+            if not periodo:
+                return
+            if self._backfill_done(periodo) is not False:
+                return  # ya hecho, o no se pudo determinar (fail closed)
+        try:
+            insertadas = await self.backfill_period(page, periodo)
+            if insertadas >= 0 and not self.backfill_dry_run:
+                self._mark_backfill_done(periodo)
+        except Exception as e:
+            logger.warning(f"backfill {periodo} falló: {type(e).__name__}: {e}")
+            await self._screenshot(page, f"backfill_{periodo}_error", error=True)
+
     async def run(self) -> List[Dict[str, Any]]:
         self._start_run()
         async with async_playwright() as p:
@@ -1229,6 +1850,8 @@ class FalabellaScraper:
                 self.pending_hashes = self._save_pending_hashes()
                 self._reset_pending()
                 movements = await self.extract_all_movements(page)
+                # El backfill va al final: si falla, la corrida del día ya está guardada.
+                await self._maybe_backfill(page)
                 self._finish_run("success")
                 return movements
             except Exception as e:
@@ -1240,9 +1863,15 @@ class FalabellaScraper:
                 await browser.close()
 
 
-def main(debug_mode: bool = False, headless: bool = False, max_per_page: int = 0, **_):
+def main(debug_mode: bool = False, headless: bool = False, max_per_page: int = 0,
+         backfill_periodo: str = "", backfill_dry_run: bool = False, **_):
+    if backfill_periodo and not re.fullmatch(r"\d{4}-\d{2}", backfill_periodo):
+        logger.error(f"--backfill-periodo espera 'YYYY-MM', recibió '{backfill_periodo}'")
+        sys.exit(2)
     scraper = FalabellaScraper(headless=headless, debug_mode=debug_mode)
     scraper.max_per_page = max_per_page
+    scraper.backfill_periodo = backfill_periodo
+    scraper.backfill_dry_run = backfill_dry_run
     movements = asyncio.run(scraper.run())
 
     if scraper._run_status == "error":
@@ -1266,5 +1895,10 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument('--limit', type=int, default=0, help='Máx movimientos por página (0=todos)')
+    parser.add_argument('--backfill-periodo', default='',
+                        help="Fuerza el backfill de un período cerrado ('YYYY-MM')")
+    parser.add_argument('--backfill-dry-run', action='store_true',
+                        help='Lista lo que falta sin escribir en la DB')
     args = parser.parse_args()
-    main(debug_mode=args.debug, headless=args.headless, max_per_page=args.limit)
+    main(debug_mode=args.debug, headless=args.headless, max_per_page=args.limit,
+         backfill_periodo=args.backfill_periodo, backfill_dry_run=args.backfill_dry_run)

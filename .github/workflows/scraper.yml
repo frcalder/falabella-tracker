@@ -4,6 +4,15 @@ on:
   schedule:
     - cron: '0 11 * * *'  # 8 AM Chile time (UTC-3)
   workflow_dispatch:
+    inputs:
+      backfill_periodo:
+        description: "Forzar backfill de un período cerrado (YYYY-MM). Vacío = automático"
+        required: false
+        default: ''
+      backfill_dry_run:
+        description: "Solo listar lo que falta, sin escribir en la DB"
+        required: false
+        default: 'false'
 
 jobs:
   scrape:
@@ -45,7 +54,20 @@ jobs:
           FALABELLA_USER: ${{ secrets.FALABELLA_USER }}
           FALABELLA_PASSWORD: ${{ secrets.FALABELLA_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python main.py --mode scraper --headless
+          # Vía env y no interpolados en la línea de comando: los inputs son texto libre.
+          # Con `schedule` llegan vacíos y el comando queda idéntico al de siempre.
+          BACKFILL_PERIODO: ${{ github.event.inputs.backfill_periodo }}
+          BACKFILL_DRY_RUN: ${{ github.event.inputs.backfill_dry_run }}
+        run: |
+          ARGS="--mode scraper --headless"
+          if [ -n "$BACKFILL_PERIODO" ]; then
+            ARGS="$ARGS --backfill-periodo $BACKFILL_PERIODO"
+          fi
+          if [ "$BACKFILL_DRY_RUN" = "true" ]; then
+            ARGS="$ARGS --backfill-dry-run"
+          fi
+          echo "python main.py $ARGS"
+          python main.py $ARGS
 
       - name: Upload debug screenshots
         if: steps.check_secrets.outputs.configured == 'true'

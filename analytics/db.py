@@ -65,6 +65,7 @@ DDL_STATEMENTS = [
         num_cuotas          TEXT,
         valor_cuota         NUMERIC,
         tx_hash             TEXT UNIQUE,
+        backfill_run_id     INTEGER,
         created_at          TIMESTAMP DEFAULT NOW(),
         updated_at          TIMESTAMP DEFAULT NOW()
     )
@@ -93,7 +94,8 @@ DDL_STATEMENTS = [
         actualizados    INTEGER DEFAULT 0,
         pendientes      INTEGER DEFAULT 0,
         error_message   TEXT,
-        periodo         TEXT
+        periodo         TEXT,
+        backfill_periodo TEXT
     )
     """,
 ]

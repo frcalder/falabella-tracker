@@ -134,6 +134,50 @@ The "Total gastado" metric in Análisis compares current period spending against
 
 The bank closes billing cycles on the 19th of each month. `periodo_facturacion` = "19/MM/YYYY" → `periodo` = "YYYY-MM". The `periodo_label` displayed in the UI is "20/MM-1 - 19/MM/YYYY". All pages (Clasificación, Presupuesto, Análisis) use the same `periodo` key for cross-referencing.
 
+### Backfill of the closed period ("Movimientos facturados")
+
+The movements page has four tabs. The scraper's main pass reads **Últimos movimientos** (the open,
+unbilled cycle). When a cycle closes on the 19th, anything still `pendiente` leaves that tab and
+`_reset_pending()` — a global `DELETE ... WHERE pendiente = TRUE` — has already removed it, so the
+tail of every cycle used to be lost permanently. `backfill_period()` recovers it from the
+**Movimientos facturados** tab.
+
+- **Same table component**: the billed tab mounts `app-invoiced-movements`, but inside it uses the
+  same `app-movements-table` as the open-cycle view, so the six columns land on the same indices and
+  `_read_row` needs no changes. The pass just overrides `self.row_selector` (restored in a `finally`);
+  `navigate_to_movements` deliberately keeps waiting for the class-level `ROW_SELECTOR`.
+- **The statement detail is published days after the close.** Right after the 19th the view shows
+  `Monto facturado` but the table says *"Aún no tienes movimientos en tu tarjeta"*. So the trigger is
+  a **daily retry**, and `scraper_runs.backfill_periodo` (the idempotency marker) is written **only if
+  the pass actually read rows**. A third state, `error_carga` ("No pudimos cargar…"), is retried with
+  the bank's own **Reintentar** button. Never mark a period from a zero-row read — that loses the
+  whole month, every month.
+- **Two phases**: phase 1 paginates reading only table cells (no modals) and computes the diff — that
+  doubles as the dry-run; phase 2 returns to page 1 and opens the modal only for the missing rows.
+- **Target period** = the `Próxima facturación` label minus one month. It flips exactly when the bank
+  rotates the label, which *is* the definition of "the cycle closed" — no clock, no timezone.
+- **The same installment is named differently in each tab**: the open-cycle view says
+  `COMPRA CUOTAS SIN INTERES X`, the billed view says `COMPRA EN CUOTAS X`, **and the date differs by
+  one day**. So `_movement_key` can never match those rows and they look missing. Two defences:
+  `_alias_key()` (description without the installment prefix + monto + cuotas, scoped to the period)
+  for honest reporting, and a hard check on `(codigo_autorizacion, num_cuotas)` — the table's real
+  unique key — before writing. Billed rows do carry auth codes.
+- **Guards**: `pendiente` forced to `False` (a statement has no pendientes, and a wrongly-pendiente
+  row would be deleted by the next run's reset while the period is already marked done); minimum 50%
+  overlap over the full row set; cap of 25 new rows; installment rows without `Cuota a pagar` are
+  skipped (`monto_periodo` would fall back to the full purchase amount). `_reset_pending()` excludes
+  `backfill_run_id IS NOT NULL`.
+- **Provenance**: `movimientos.backfill_run_id` records which run inserted a row, set **only on
+  INSERT, never in the `DO UPDATE`**, so `DELETE ... WHERE backfill_run_id = N` reverts exactly what
+  the backfill created. `scripts/backup_db.py` does not back up `splits` or `scraper_runs`, so the
+  daily backup is not a rollback path.
+- **CLI**: `--backfill-periodo YYYY-MM` forces a period (the bank offers the last 12 statements),
+  `--backfill-dry-run` lists what's missing without writing. Both are exposed as
+  `workflow_dispatch` inputs and in the dashboard's Scraper page. `--limit` suppresses the automatic
+  trigger so a truncated test run can't consume the marker.
+- **Reconciliation against `Monto facturado` is log-only** — payments and refunds break the equality
+  legitimately (period `2026-06` nets to −3,913,514).
+
 ### Infrastructure
 
 - **Scraper**: GitHub Actions (`.github/workflows/scraper.yml`), runs daily at 11:00 UTC, also triggerable from Streamlit dashboard via GitHub API.

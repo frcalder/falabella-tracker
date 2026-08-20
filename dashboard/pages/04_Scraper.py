@@ -28,7 +28,7 @@ def load_runs(conn) -> pd.DataFrame:
             """
             SELECT id, started_at, finished_at, status, headless,
                    paginas, procesados, nuevos, actualizados, pendientes,
-                   periodo, error_message
+                   periodo, backfill_periodo, error_message
             FROM scraper_runs
             ORDER BY started_at DESC
             LIMIT 50
@@ -40,8 +40,12 @@ def load_runs(conn) -> pd.DataFrame:
     return pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
 
 
-def trigger_github_action(token: str) -> tuple[bool, str]:
+def trigger_github_action(token: str, inputs: dict | None = None) -> tuple[bool, str]:
     url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/{GITHUB_WORKFLOW}/dispatches"
+    payload: dict = {"ref": "main"}
+    if inputs:
+        # La API de dispatch espera los inputs como strings.
+        payload["inputs"] = {k: str(v) for k, v in inputs.items() if v not in ("", None)}
     resp = requests.post(
         url,
         headers={
@@ -49,7 +53,7 @@ def trigger_github_action(token: str) -> tuple[bool, str]:
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         },
-        json={"ref": "main"},
+        json=payload,
         timeout=10,
     )
     if resp.status_code == 204:
@@ -71,9 +75,24 @@ if not github_token:
         help="Necesita permiso `actions:write`. Solo se usa para disparar el workflow.",
     )
 
+with st.expander("Opciones avanzadas — backfill de un período cerrado"):
+    st.caption(
+        "El scraper completa solo el período recién cerrado desde la pestaña *Movimientos "
+        "facturados*, la primera vez que el banco publica el detalle del estado de cuenta. "
+        "Estas opciones sirven para forzar un período puntual (por ejemplo para recuperar un "
+        "mes viejo). El banco ofrece los últimos 12 estados de cuenta."
+    )
+    backfill_periodo = st.text_input("Período a completar (YYYY-MM)", value="",
+                                    placeholder="2026-07")
+    backfill_dry_run = st.checkbox("Dry-run: solo listar lo que falta, sin escribir en la DB")
+
 if st.button("▶ Ejecutar ahora", type="primary", disabled=not github_token):
+    inputs = {
+        "backfill_periodo": backfill_periodo.strip(),
+        "backfill_dry_run": "true" if backfill_dry_run else "",
+    }
     with st.spinner("Disparando workflow..."):
-        ok, msg = trigger_github_action(github_token)
+        ok, msg = trigger_github_action(github_token, inputs)
     if ok:
         st.success(msg)
         st.caption("El scraper tardará ~5 min. Recarga la página para ver el nuevo run.")
@@ -115,7 +134,7 @@ else:
     st.dataframe(
         df[[
             "started_at", "finished_at", "duracion", "status",
-            "periodo", "paginas", "nuevos", "actualizados", "pendientes",
+            "periodo", "backfill_periodo", "paginas", "nuevos", "actualizados", "pendientes",
             "error_message",
         ]].rename(columns={
             "started_at":   "Inicio",
@@ -123,6 +142,7 @@ else:
             "duracion":     "Duración",
             "status":       "Estado",
             "periodo":      "Período",
+            "backfill_periodo": "Backfill",
             "paginas":      "Págs",
             "nuevos":       "Nuevos",
             "actualizados": "Actualizados",
