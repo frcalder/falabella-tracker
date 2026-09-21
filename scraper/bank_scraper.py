@@ -9,6 +9,7 @@ import logging
 import asyncio
 import re
 import hashlib
+from collections import Counter
 from datetime import date
 from typing import List, Dict, Any, Optional
 from pathlib import Path
@@ -373,7 +374,11 @@ class FalabellaScraper:
         self.backfill_max_new: int = 25      # tope de filas nuevas por pase
         self.backfill_min_overlap: float = 0.5
         self._in_backfill: bool = False      # lo lee _upsert_to_db para sellar la procedencia
-        self.existing_keys: set = self._load_existing_keys()
+        # Cuántas filas tiene la DB por clave, no si la tiene: el banco cobra a veces dos
+        # movimientos idénticos el mismo día (mismo comercio, mismo monto) y la clave natural
+        # no los distingue. Con un set, el segundo se daba por procesado y se perdía.
+        self.existing_keys: Counter = self._load_existing_keys()
+        self.seen_keys: Counter = Counter()  # cuántas veces vimos cada clave en este pase
         self.incomplete_keys: set = self._load_incomplete_keys()
         self.pending_hashes: dict = {}  # {(desc_norm, monto_norm): tx_hash} — cargado antes de _reset_pending
 
@@ -494,8 +499,13 @@ class FalabellaScraper:
         return (str(m.get("fecha", "")), str(m.get("descripcion", "")), monto_norm, num_cuotas,
                 self._periodo_de(m))
 
-    def _load_existing_keys(self) -> set:
-        """Carga claves de movimientos confirmados desde la DB."""
+    def _load_existing_keys(self) -> Counter:
+        """Cuántas filas confirmadas hay en la DB por clave de checkpoint.
+
+        Es un conteo y no un conjunto porque la clave natural no es única: dos compras
+        idénticas del mismo día (mismo comercio, mismo monto, misma cuota) comparten clave y
+        solo se distinguen por el `codigo_autorizacion`, que recién aparece al abrir el modal.
+        Guardando cuántas hay, la segunda aparición se procesa en vez de darse por vista."""
         try:
             cur = self.db_conn.cursor()
             cur.execute(
@@ -504,7 +514,7 @@ class FalabellaScraper:
             )
             rows = cur.fetchall()
             cur.close()
-            keys = set()
+            keys: Counter = Counter()
             for row in rows:
                 fecha_row = row.get("fecha")
                 fecha_str = fecha_row.strftime("%d/%m/%Y") if fecha_row else ""
@@ -512,10 +522,10 @@ class FalabellaScraper:
                 monto_norm = str(int(abs(float(row.get("monto") or 0))))
                 num_cuotas = str(row.get("num_cuotas", "") or "").strip()
                 periodo = str(row.get("periodo") or "")
-                keys.add((fecha_str, desc, monto_norm, num_cuotas, periodo))
+                keys[(fecha_str, desc, monto_norm, num_cuotas, periodo)] += 1
             return keys
         except Exception:
-            return set()
+            return Counter()
 
     def _load_incomplete_keys(self) -> set:
         """Claves de filas confirmadas que faltan rubro o comercio del modal.
@@ -1176,13 +1186,14 @@ class FalabellaScraper:
         return (self._desc_alias(movement.get("descripcion", "")), monto_norm, cuotas)
 
     def _load_period_index(self, periodo: str) -> tuple:
-        """(auth_keys, alias_keys) de un período: la identidad que ya está guardada.
+        """(auth_keys, alias_budget) de un período: la identidad que ya está guardada.
 
         `auth_keys` es la llave única real de la tabla `(codigo_autorizacion, num_cuotas)` y es la
-        guarda dura antes de escribir. `alias_keys` es la tolerante, para clasificar bien las
-        candidatas en el reporte y no abrir modales al vacío.
+        guarda dura antes de escribir. `alias_budget` cuenta cuántas filas guardadas hay por
+        clave tolerante — una fila del estado de cuenta consume una, así que dos cobros
+        idénticos del mismo día solo quedan cubiertos si la DB tiene los dos.
         """
-        auth_keys, alias_keys = set(), set()
+        auth_keys, alias_budget = set(), Counter()
         cur = self.db_conn.cursor()
         try:
             cur.execute(
@@ -1195,13 +1206,13 @@ class FalabellaScraper:
                 if r["codigo_autorizacion"]:
                     auth_keys.add((self._normalize_auth(r["codigo_autorizacion"]), cuotas))
                 monto_norm = str(int(abs(float(r["monto"] or 0))))
-                alias_keys.add((self._desc_alias(r["descripcion"]), monto_norm, cuotas))
+                alias_budget[(self._desc_alias(r["descripcion"]), monto_norm, cuotas)] += 1
         except Exception as e:
             logger.warning(f"No se pudo indexar el período {periodo}: {e}")
         finally:
             cur.close()
             self.db_conn.rollback()
-        return auth_keys, alias_keys
+        return auth_keys, alias_budget
 
     def _backfill_row_ok(self, movement: Dict[str, Any]) -> tuple:
         """(ok, motivo) — filtros de sanidad sobre una fila del estado de cuenta."""
@@ -1493,18 +1504,25 @@ class FalabellaScraper:
                 logger.warning(f"backfill {periodo}: 0 filas leídas")
                 return -1
 
-            auth_keys, alias_keys = self._load_period_index(periodo)
+            auth_keys, alias_budget = self._load_period_index(periodo)
 
-            conocidas = sum(1 for c in collected if c[3] in self.existing_keys)
-            por_alias = [
-                c for c in collected
-                if c[3] not in self.existing_keys and self._alias_key(c[2]) in alias_keys
-            ]
-            solape = (conocidas + len(por_alias)) / total
+            # Cada fila guardada cubre UNA fila del estado de cuenta. Contarlas en vez de
+            # preguntar si la clave existe es lo que hace visible el segundo de dos cobros
+            # idénticos del mismo día: la DB tiene uno, el estado de cuenta trae dos, y el que
+            # sobra queda como candidato en vez de darse por conocido.
+            cubiertas, por_alias = set(), []
+            for c in collected:
+                a = self._alias_key(c[2])
+                if alias_budget[a] > 0:
+                    alias_budget[a] -= 1
+                    cubiertas.add((c[0], c[1]))
+                    if c[3] not in self.existing_keys:
+                        por_alias.append(c)  # cubierta, pero con otra descripción o fecha
+            solape = len(cubiertas) / total
             logger.info(
                 f"backfill {periodo}: {total} filas en el estado de cuenta, "
-                f"{conocidas} ya en la DB por clave natural, {len(por_alias)} por descripción "
-                f"alternativa (solape {solape:.0%})"
+                f"{len(cubiertas)} ya en la DB ({len(por_alias)} de ellas con descripción o "
+                f"fecha distinta) (solape {solape:.0%})"
             )
             for c in por_alias:
                 logger.info(
@@ -1519,10 +1537,9 @@ class FalabellaScraper:
                 )
                 return -1
 
-            alias_por_saltar = {(c[0], c[1]) for c in por_alias}
             candidatas, descartadas = [], []
             for c in collected:
-                if c[3] in self.existing_keys or (c[0], c[1]) in alias_por_saltar:
+                if (c[0], c[1]) in cubiertas:
                     continue
                 ok, motivo = self._backfill_row_ok(c[2])
                 (candidatas if ok else descartadas).append((c, motivo))
@@ -1601,7 +1618,7 @@ class FalabellaScraper:
                         # borraría, con el período ya marcado como hecho.
                         mv["pendiente"] = False
                         self._upsert_to_db(mv)
-                        self.existing_keys.add(self._movement_key(mv))
+                        self.existing_keys[self._movement_key(mv)] += 1
                         insertadas += 1
                         self._cnt_procesados += 1
                         self._cnt_nuevos += 1
@@ -1812,10 +1829,15 @@ class FalabellaScraper:
                     continue
 
                 key = self._movement_key(movement)
+                self.seen_keys[key] += 1
 
-                # Saltar solo si es confirmado (tiene num_cuotas), ya está en DB y no está incompleto.
+                # Saltar solo si es confirmado (tiene num_cuotas), ya está en DB y no está
+                # incompleto. Se compara contra cuántas filas con esa clave tiene la DB: si el
+                # banco muestra dos movimientos idénticos y la DB tiene uno, la segunda
+                # aparición se procesa igual y el modal revela su propio codigo_autorizacion.
                 # Pendientes nunca tienen num_cuotas → siempre se procesan sin importar existing_keys.
-                if movement.get("num_cuotas") and key in self.existing_keys and key not in self.incomplete_keys:
+                if (movement.get("num_cuotas") and self.seen_keys[key] <= self.existing_keys[key]
+                        and key not in self.incomplete_keys):
                     logger.info(f"  [{i+1}/{total_rows}] Ya procesado — {movement.get('descripcion', '?')}")
                     continue
                 if movement.get("num_cuotas") and key in self.incomplete_keys:
@@ -1846,9 +1868,13 @@ class FalabellaScraper:
                 )
                 movement["periodo_facturacion"] = self.periodo_facturacion
 
-                is_new = key not in self.existing_keys
+                is_new = self.seen_keys[key] > self.existing_keys[key]
                 self._upsert_to_db(movement)
-                self.existing_keys.add(self._movement_key(movement))
+                if is_new:
+                    # Solo cuando agrega una fila: re-procesar una incompleta no cambia cuántas
+                    # filas con esa clave hay en la DB, y subir el presupuesto de más volvería a
+                    # esconder un segundo cobro idéntico.
+                    self.existing_keys[self._movement_key(movement)] += 1
                 all_movements.append(movement)
                 new_on_page += 1
                 self._cnt_procesados += 1

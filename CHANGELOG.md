@@ -1,5 +1,32 @@
 # Changelog
 
+## 2026-09-21 (2)
+
+### Fix: dos cobros idénticos el mismo día se guardaban como uno solo
+
+**Síntoma:** la reconciliación de `2026-09` daba $4.505.274 contra los $4.507.930 que informa el banco. El estado de cuenta trae **108 filas** y la DB tenía **106**; sumando las filas del propio estado de cuenta da $4.510.274, que menos la `DEVOLUCION COMPRA TOTTUS APP` de −$2.344 son exactamente los $4.507.930 del banco. Faltaba una fila de $5.000: el banco cobró **dos `COMPRA APP SBUX REWARDS CL` idénticos el 19/08** y la DB guardó uno.
+
+**Causa raíz:** la clave de checkpoint `(fecha, descripcion, monto, num_cuotas, periodo)` **no es única** — dos compras iguales del mismo día la comparten y solo se distinguen por el `codigo_autorizacion`, que aparece recién al abrir el modal. `existing_keys` era un `set`, así que:
+
+- en el pase normal, la primera fila se procesaba, su clave entraba al set y la segunda salía como *"Ya procesado"* **antes de abrir su modal** — nunca se supo que tenía otro código de autorización. Como `_reset_pending()` ya había borrado su versión pendiente, la transacción desaparecía;
+- en el backfill, las dos filas del estado de cuenta matcheaban contra la única fila guardada y el diff daba "no falta ninguna" (se veía en el log: 105 filas "ya en la DB" contra 104 filas realmente guardadas).
+
+**Fix (`scraper/bank_scraper.py`):** dejar de preguntar *si* la clave está y pasar a contar *cuántas* filas hay con esa clave.
+
+- `_load_existing_keys()` devuelve un `Counter` y `seen_keys` lleva cuántas veces se vio cada clave en el pase. Se saltea solo mientras `vistas <= guardadas`: con dos filas iguales y una guardada, la segunda se procesa y su modal revela su propio código.
+- `_load_period_index()` devuelve `alias_budget` (un `Counter`): cada fila guardada cubre **una** fila del estado de cuenta, así que la que sobra queda como candidata. Reemplaza el doble chequeo clave natural + alias por un solo presupuesto por período.
+- No puede crear duplicados: la unicidad real la sigue imponiendo `(codigo_autorizacion, num_cuotas)`. Si las dos filas fueran la misma transacción listada dos veces, la segunda actualiza en vez de insertar; el costo es abrir un modal de más.
+
+**Limpieza de DB:** ninguna, pero el período cerrado hay que volver a pasarlo para recuperar lo perdido:
+
+```bash
+# primero mirar qué falta, sin escribir
+pipenv run python main.py --mode scraper --headless --backfill-periodo 2026-09 --backfill-dry-run
+# y recién después
+pipenv run python main.py --mode scraper --headless --backfill-periodo 2026-09
+```
+
+**Verificado:** el backfill de `2026-09` recuperó el segundo Starbucks con su propio `codigo_autorizacion` (360621, distinto del 360154 de la primera compra) y la reconciliación quedó en $4.510.274 contra $4.507.930 — la diferencia es exactamente la devolución de $2.344, que el banco netea en el total y `_reconcile_log` cuenta aparte. Septiembre cuadra al peso.
 ## 2026-09-21
 
 ### Fix: la primera cuota de una compra con interés no se registraba en el período que la cobra
