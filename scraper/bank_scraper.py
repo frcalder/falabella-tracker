@@ -468,20 +468,39 @@ class FalabellaScraper:
             self.db_conn.rollback()
             logger.warning(f"No se pudo registrar fin de run: {e}")
 
+    def _periodo_de(self, m: Dict) -> str:
+        """'YYYY-MM' del período de facturación de la fila, con la misma derivación que
+        `_upsert_to_db`. El pase normal no setea `periodo_facturacion` antes de calcular la
+        clave, así que cae al del ciclo vigente; el pase de facturados lo setea por fila con el
+        label del estado de cuenta."""
+        raw = str(m.get("periodo_facturacion") or self.periodo_facturacion or "").strip()
+        d = _parse_date(raw)
+        return d.strftime("%Y-%m") if d else raw
+
     def _movement_key(self, m: Dict) -> tuple:
-        """Clave de checkpoint: (fecha, descripcion, monto, num_cuotas).
+        """Clave de checkpoint: (fecha, descripcion, monto, num_cuotas, periodo).
         Usa fecha de la tabla (no fecha_compra del modal) para ser consistente
-        con lo que se lee antes de abrir el detalle."""
+        con lo que se lee antes de abrir el detalle.
+
+        El período es parte de la clave porque el banco vuelve a servir la misma fila en el
+        ciclo siguiente cuando la compra es **en cuotas con interés**: el mes de la compra la
+        muestra como `01/03` pero la factura como cuota cero, y al mes siguiente repite
+        `01/03` — misma fecha, misma descripción, mismo monto. Sin el período esa fila
+        colisionaba con la del mes anterior y se saltaba, así que la cuota nunca se registraba
+        en el período que la cobra. En las compras sin interés el número de cuota avanza solo
+        y la clave ya cambiaba."""
         num_cuotas = str(m.get("num_cuotas", "") or "").strip()
         monto_norm = str(int(abs(_parse_monto(str(m.get("monto", "") or "")) or 0)))
-        return (str(m.get("fecha", "")), str(m.get("descripcion", "")), monto_norm, num_cuotas)
+        return (str(m.get("fecha", "")), str(m.get("descripcion", "")), monto_norm, num_cuotas,
+                self._periodo_de(m))
 
     def _load_existing_keys(self) -> set:
         """Carga claves de movimientos confirmados desde la DB."""
         try:
             cur = self.db_conn.cursor()
             cur.execute(
-                "SELECT fecha, descripcion, monto, num_cuotas FROM movimientos WHERE pendiente = FALSE"
+                "SELECT fecha, descripcion, monto, num_cuotas, periodo FROM movimientos "
+                " WHERE pendiente = FALSE"
             )
             rows = cur.fetchall()
             cur.close()
@@ -492,7 +511,8 @@ class FalabellaScraper:
                 desc = str(row.get("descripcion", "") or "")
                 monto_norm = str(int(abs(float(row.get("monto") or 0))))
                 num_cuotas = str(row.get("num_cuotas", "") or "").strip()
-                keys.add((fecha_str, desc, monto_norm, num_cuotas))
+                periodo = str(row.get("periodo") or "")
+                keys.add((fecha_str, desc, monto_norm, num_cuotas, periodo))
             return keys
         except Exception:
             return set()
@@ -506,7 +526,7 @@ class FalabellaScraper:
             cur = self.db_conn.cursor()
             cur.execute(
                 """
-                SELECT fecha, descripcion, monto, num_cuotas FROM movimientos
+                SELECT fecha, descripcion, monto, num_cuotas, periodo FROM movimientos
                 WHERE pendiente = FALSE
                   AND (
                     -- Solo se reintenta si falta rubro o comercio (ver docstring: reintentar
@@ -526,7 +546,8 @@ class FalabellaScraper:
                 desc = str(row.get("descripcion", "") or "")
                 monto_norm = str(int(abs(float(row.get("monto") or 0))))
                 num_cuotas = str(row.get("num_cuotas", "") or "").strip()
-                incomplete.add((fecha_str, desc, monto_norm, num_cuotas))
+                periodo = str(row.get("periodo") or "")
+                incomplete.add((fecha_str, desc, monto_norm, num_cuotas, periodo))
             if incomplete:
                 logger.info(f"Checkpoint: {len(incomplete)} filas incompletas serán re-procesadas")
             return incomplete
@@ -1187,6 +1208,15 @@ class FalabellaScraper:
         if not DATE_RE.match(str(movement.get("fecha", "") or "")):
             return False, "sin fecha en la tabla"
         cuotas = str(movement.get("num_cuotas", "") or "").strip()
+        # Cuota cero: el estado de cuenta lista la compra pero todavía no le cobra cuota. Pasa
+        # con las compras en cuotas **con interés** el mes de la compra: el período solo cobra
+        # el impuesto y la primera cuota se cobra recién en el ciclo siguiente. La columna
+        # "Cuota a pagar" igual muestra el valor de la cuota que viene, así que no sirve para
+        # distinguir: el 19/09/2026 la IKEA aparece como 00/03 con $72.336 y el "Monto
+        # facturado" del banco ($4.507.930) no la incluye. Guardarla duplicaría la cuota.
+        nro = re.match(r"\s*(\d+)", cuotas)
+        if nro and int(nro.group(1)) == 0:
+            return False, f"cuota {cuotas} — el período todavía no cobra cuota"
         en_cuotas = cuotas not in ("", "01/01", "01 de 01", "/")
         if en_cuotas and not str(movement.get("valor_cuota", "") or "").strip():
             # monto_periodo caería al monto total de la compra e inflaría el período.
@@ -1313,10 +1343,12 @@ class FalabellaScraper:
                 await page.wait_for_timeout(1200)
         return False
 
-    async def _billed_collect(self, page: Page) -> List[tuple]:
+    async def _billed_collect(self, page: Page, label: str) -> List[tuple]:
         """Fase 1: recorre las páginas leyendo SOLO celdas de tabla. No abre modales ni escribe.
 
-        Devuelve [(nro_pagina, indice_fila, movimiento, clave), ...].
+        Devuelve [(nro_pagina, indice_fila, movimiento, clave), ...]. `label` es el estado de
+        cuenta en pantalla: va en cada fila porque la clave de checkpoint lleva el período, y
+        acá el período es el del estado de cuenta, no el del ciclo vigente.
         """
         collected: List[tuple] = []
         page_num, prev_sig, ultima_llena = 0, "", False
@@ -1336,12 +1368,16 @@ class FalabellaScraper:
                 mv = await self._read_row(page, i)
                 if not mv.get("descripcion", "").strip() and not mv.get("monto", "").strip():
                     continue
+                mv["periodo_facturacion"] = label
                 collected.append((page_num, i, mv, self._movement_key(mv)))
                 leidas += 1
             logger.info(f"  Página {page_num}: {leidas} filas")
-            # Una paginación que termina bien lo hace con una página parcial. Si la última vino
-            # completa y encima el chequeo dice que no hay siguiente, es sospechoso de corte.
-            ultima_llena = leidas >= self.BILLED_PAGE_SIZE
+            # Una paginación que termina bien lo hace con una página parcial y no vacía. Si la
+            # última vino completa —o vacía, que es Angular a medio renderizar— y encima el
+            # chequeo dice que no hay siguiente, es sospechoso de corte. La página vacía hay
+            # que contarla: si no, "limpia" la sospecha de la anterior que vino llena y el pase
+            # da por completo un estado de cuenta leído a medias (visto: 40 de 108 filas).
+            ultima_llena = leidas >= self.BILLED_PAGE_SIZE or (leidas == 0 and bool(collected))
 
             if not await self._billed_has_next(page):
                 break
@@ -1349,8 +1385,8 @@ class FalabellaScraper:
 
         if ultima_llena:
             logger.warning(
-                f"  la última página vino completa ({self.BILLED_PAGE_SIZE} filas) y el botón de "
-                f"siguiente no apareció — la lectura pudo quedar cortada"
+                f"  la última página no vino parcial (llena de {self.BILLED_PAGE_SIZE} filas o "
+                f"vacía) y el botón de siguiente no apareció — la lectura pudo quedar cortada"
             )
             return []  # se aborta el pase: mejor reintentar mañana que marcar incompleto
         return collected
@@ -1451,7 +1487,7 @@ class FalabellaScraper:
         self.row_selector = self.BILLED_ROW_SELECTOR
         try:
             logger.info(f"backfill {periodo}: leyendo el estado de cuenta {label}")
-            collected = await self._billed_collect(page)
+            collected = await self._billed_collect(page, label)
             total = len(collected)
             if total == 0:
                 logger.warning(f"backfill {periodo}: 0 filas leídas")
@@ -1493,7 +1529,8 @@ class FalabellaScraper:
             for (c, motivo) in descartadas:
                 logger.warning(
                     f"  descartada ({motivo}): {c[2].get('fecha')} "
-                    f"{c[2].get('descripcion')} {c[2].get('monto')}"
+                    f"{c[2].get('descripcion')} {c[2].get('monto')} | "
+                    f"cuotas {c[2].get('num_cuotas')} | cuota a pagar {c[2].get('valor_cuota')}"
                 )
             if not candidatas:
                 logger.info(f"backfill {periodo}: no falta ninguna fila")
@@ -1536,6 +1573,7 @@ class FalabellaScraper:
                     page_num += 1
                     for (idx, key) in objetivo.get(page_num, []):
                         mv = await self._read_row(page, idx)
+                        mv["periodo_facturacion"] = label  # antes de la clave: la lleva dentro
                         if self._movement_key(mv) != key:
                             logger.warning(
                                 f"  fila {idx} de la página {page_num} no coincide con la "
@@ -1562,7 +1600,6 @@ class FalabellaScraper:
                         # de extract_all_movements marcaría pendiente y el reset de mañana la
                         # borraría, con el período ya marcado como hecho.
                         mv["pendiente"] = False
-                        mv["periodo_facturacion"] = label
                         self._upsert_to_db(mv)
                         self.existing_keys.add(self._movement_key(mv))
                         insertadas += 1

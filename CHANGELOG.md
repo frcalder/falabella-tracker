@@ -1,5 +1,35 @@
 # Changelog
 
+## 2026-09-21
+
+### Fix: la primera cuota de una compra con interés no se registraba en el período que la cobra
+
+**Síntoma:** la compra `COMPRA IKEA OPEN KENNEDY` (06/09/2026, $196.730 en 3 cuotas con interés, auth `771206`) no aparecía en el período abierto del dashboard. Estaba en la DB pero en `periodo = 2026-09`, y en el ciclo que cierra el 19/10 —donde el banco sí la muestra— no existía.
+
+**Causa raíz:** la clave de checkpoint `_movement_key` era `(fecha, descripcion, monto, num_cuotas)`, **sin el período**. En las compras *sin interés* nunca molestó porque el banco avanza el número de cuota cada mes (01/03 → 02/03 → 03/03) y la clave cambia sola. En una compra **con interés** el banco repite la fila idéntica en el ciclo siguiente —misma fecha, misma descripción, mismo monto y otra vez `01/03`—, así que la clave colisionaba con la del mes anterior y `extract_all_movements` la descartaba:
+
+```
+[7/11] Ya procesado — COMPRA IKEA OPEN KENNEDY
+```
+
+Cómo factura el banco estas compras: el mes de la compra el ciclo abierto la muestra como `01/03`, pero el estado de cuenta de ese mes la lista como **`00/03`** y solo cobra el impuesto (`IMPUESTO COMPRA CUOTAS …`). La columna "Cuota a pagar" igual muestra el valor de la cuota que viene ($72.336), así que no sirve para distinguir; el "Monto facturado" del banco sí: el del 19/09/2026 ($4.507.930) no la incluye. La cuota 1 se cobra recién en el ciclo siguiente.
+
+**Fix (`scraper/bank_scraper.py`):**
+- `_movement_key()` incorpora el período (`YYYY-MM`, vía el nuevo `_periodo_de()`), y `_load_existing_keys()` / `_load_incomplete_keys()` lo traen de la DB. En el pase normal cae al del ciclo vigente; el pase de facturados lo setea por fila con el label del estado de cuenta (`_billed_collect()` ahora lo recibe), lo que además acota su chequeo de duplicados al período que está leyendo.
+- `_backfill_row_ok()` descarta las filas con cuota `0/N`: el estado de cuenta las lista pero el período no las cobra. Sin esto el backfill volvía a meter la cuota en el mes viejo y quedaba duplicada.
+- Guarda de paginación del estado de cuenta: una página **vacía** ahora también cuenta como lectura sospechosa de corte. Antes "limpiaba" la sospecha que dejaba la página llena anterior y el pase daba por completo un estado de cuenta leído a medias (visto en una verificación: 40 de 108 filas, reportadas como "no falta ninguna fila" / "1 fila faltante").
+
+**Limpieza de DB:** ninguna, pero conviene revisarla si tienes una compra en cuotas **con interés**. La fila se mueve sola de período en la primera corrida con el fix (`ON CONFLICT (codigo_autorizacion, num_cuotas)` la actualiza, no la duplica) y la clasificación viaja con el `codigo_autorizacion`. Para comprobarlo:
+
+```sql
+SELECT id, periodo, periodo_facturacion, num_cuotas, monto_periodo
+  FROM movimientos WHERE codigo_autorizacion = '771206';
+-- debe quedar UNA fila, en el período que cobra la cuota
+```
+
+**Verificado:** corrida real — la IKEA pasa de "Ya procesado" a `(confirmado) COMPRA IKEA OPEN KENNEDY — $196.730`, las otras cuotas del ciclo siguen salteándose (no hay re-procesamiento masivo), la fila queda única en `2026-10` y septiembre baja $72.336. El backfill de `2026-09` descarta la fila `00/03` con el motivo esperado, inserta las 2 filas de la cola del ciclo que sí faltaban y la reconciliación contra el "Monto facturado" del banco pasa de una diferencia de ~$70.000 a $2.656.
+
+**Pendiente de observación:** en el ciclo de noviembre hay que confirmar que la IKEA entra como fila **nueva** `02/03` y que la de octubre no se mueve. Si el banco repitiera `01/03` todos los meses, la identidad de estas compras dejaría de ser `(codigo_autorizacion, num_cuotas)` y habría que ampliarla con el período.
 ## 2026-08-20 (4)
 
 ### Fix: la lectura del estado de cuenta se cortaba a mitad y marcaba el período como completo
