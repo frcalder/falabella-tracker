@@ -1036,7 +1036,12 @@ class FalabellaScraper:
         # se toma ~30 s después, con el drawer ya cerrado y sin rastro del mensaje del banco
         # (2026-09-26: tres intentos fallidos y el screenshot solo mostraba la home).
         await page.wait_for_timeout(2500)
-        after_submit_png = await page.screenshot()
+        try:
+            # En pleno salto al área privada el screenshot puede fallar; no debe tumbar un
+            # login que sí funcionó.
+            after_submit_png = await page.screenshot()
+        except Exception:
+            after_submit_png = b""
         try:
             after_submit_txt = await page.locator("form:has(#pass)").first.inner_text(timeout=1000)
         except Exception:
@@ -1056,7 +1061,8 @@ class FalabellaScraper:
                 pass
             logger.error("Login fallido")
             logger.error("Drawer tras el submit: %s", " ".join(after_submit_txt.split())[:300])
-            (DEBUG_DIR / "screenshots" / "login_after_submit.png").write_bytes(after_submit_png)
+            if after_submit_png:
+                (DEBUG_DIR / "screenshots" / "login_after_submit.png").write_bytes(after_submit_png)
             await self._screenshot(page, "login_failed", error=True)
             return False
 
