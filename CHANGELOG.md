@@ -1,5 +1,42 @@
 # Changelog
 
+## 2026-09-26
+
+### Fix: un pendiente sin código de autorización se guardaba como confirmado (duplicado)
+
+**Síntoma:** un mismo cargo aparece dos veces en el período abierto: una fila confirmada con fecha, y otra **sin fecha**, sin rubro, hora `00:00` y `pendiente = FALSE`, a veces con una descripción más corta (ej. `COMPRA APPLE` vs `COMPRA APPLE.COM/BILL`). Ninguna de las dos tiene `codigo_autorizacion`.
+
+**Causa raíz:** `extract_all_movements` decidía `pendiente` según la estructura que sirviera el banco, y la rama *"sin auth code pero el modal cargó"* (la de abril–mayo 2026) usa `Cuotas` presente = confirmado. En la estructura actual los pendientes **también** traen `Cuotas` (`01/01`), así que un pendiente cuyo modal llegó sin auth code se guardaba como confirmado aunque la tabla no le mostrara fecha. Una vez así queda fuera del alcance de `_reset_pending()` para siempre, y cuando el banco lo confirma con otra descripción el hash cambia y entra como fila nueva.
+
+**Fix (`scraper/bank_scraper.py`):** *sin fecha en la tabla = pendiente* se evalúa primero, antes de mirar el modal. En la estructura de abril–mayo los pendientes sí mostraban fecha, así que ahí no cambia nada; las filas con fecha siguen la misma lógica de antes.
+
+**Limpieza de DB:** revisar primero —debería devolver cero filas o solo pendientes mal marcados:
+
+```sql
+SELECT id, descripcion, monto, fecha_compra, codigo_autorizacion, tx_hash, periodo
+  FROM movimientos WHERE fecha IS NULL AND pendiente = FALSE;
+```
+
+Para cada fila, confirmar que exista su versión confirmada (misma compra, con fecha) antes de borrar. Si la clasificaste, clasifica también la confirmada. Después borra la fila y lo que dependa de su `tx_hash`:
+
+```sql
+DELETE FROM splits          WHERE tx_hash = '<hash>';
+DELETE FROM clasificaciones WHERE tx_hash = '<hash>';
+DELETE FROM movimientos     WHERE id = <id>;
+```
+
+**Hueco conocido, sin fix:** si un pendiente sin auth code cambia de **descripción** al confirmarse, su clasificación no se migra: el bloque de migración de `_save_movement` cubre cambios de `fecha_compra`, no de descripción. Hay que volver a clasificarlo.
+
+### Fix: "No pudimos cargar tus últimos movimientos" hacía fallar la corrida
+
+**Síntoma:** la corrida termina en `Navegación a movimientos fallida` / `No apareció la tabla`, y el screenshot `movements_table_not_found.png` muestra el error transitorio del banco en *Últimos movimientos* con su botón **Reintentar**.
+
+**Fix:** `navigate_to_movements` ahora espera las filas con `_wait_last_movements()`, que detecta ese estado en `app-last-movements` y hace clic en Reintentar hasta 3 veces, igual que ya se hacía en la pestaña de facturados.
+
+### Diagnóstico: el screenshot de un login fallido no mostraba el mensaje del banco
+
+`login_failed.png` se toma ~30 s después del submit, con el drawer ya cerrado. Ahora, si el login falla, también se guardan `login_after_submit.png` y el texto del drawer (en el log) 2,5 s después del submit.
+
 ## 2026-09-21 (2)
 
 ### Fix: dos cobros idénticos el mismo día se guardaban como uno solo

@@ -273,6 +273,18 @@ JS_BILLED_STATE = """
 }
 """
 
+# Mismo "No pudimos cargar..." pero en Últimos movimientos (visto el 2026-09-25: la corrida
+# terminó en "No apareció la tabla" con el botón Reintentar del banco en pantalla).
+JS_LAST_MOVEMENTS_ERROR = """
+() => {
+""" + _JS_WALK + """
+    const comp = find(el => el.tagName === 'APP-LAST-MOVEMENTS')[0];
+    if (!comp) return false;
+    return /No pudimos cargar/i.test(comp.textContent.replace(/\\s+/g, ' '));
+}
+"""
+
+# No está acotado a la pestaña de facturados: sirve igual para Últimos movimientos.
 JS_CLICK_BILLED_RETRY = """
 () => {
 """ + _JS_WALK + """
@@ -1020,6 +1032,16 @@ class FalabellaScraper:
             logger.error("No apareció el botón de login habilitado")
             return False
 
+        # Lo que muestra el drawer justo después del submit: si el login falla, `login_failed`
+        # se toma ~30 s después, con el drawer ya cerrado y sin rastro del mensaje del banco
+        # (2026-09-26: tres intentos fallidos y el screenshot solo mostraba la home).
+        await page.wait_for_timeout(2500)
+        after_submit_png = await page.screenshot()
+        try:
+            after_submit_txt = await page.locator("form:has(#pass)").first.inner_text(timeout=1000)
+        except Exception:
+            after_submit_txt = "(drawer cerrado)"
+
         try:
             await page.wait_for_selector("//span[normalize-space(text())='Hola']", timeout=20000)
             logger.info("Login exitoso")
@@ -1033,6 +1055,8 @@ class FalabellaScraper:
             except Exception:
                 pass
             logger.error("Login fallido")
+            logger.error("Drawer tras el submit: %s", " ".join(after_submit_txt.split())[:300])
+            (DEBUG_DIR / "screenshots" / "login_after_submit.png").write_bytes(after_submit_png)
             await self._screenshot(page, "login_failed", error=True)
             return False
 
@@ -1070,7 +1094,7 @@ class FalabellaScraper:
         try:
             # Siempre la pestaña por defecto: el override de `row_selector` del pase de
             # facturados no debe afectar la navegación inicial.
-            await page.wait_for_selector(self.ROW_SELECTOR, timeout=30000)
+            await self._wait_last_movements(page)
             logger.info("Tabla cargada")
             await self._screenshot(page, "movements_loaded")
             self.periodo_facturacion = await self._extract_periodo(page)
@@ -1081,6 +1105,26 @@ class FalabellaScraper:
             await self._screenshot(page, "movements_table_not_found", error=True)
             logger.error("No apareció la tabla")
             return False
+
+    async def _wait_last_movements(self, page: Page, retries: int = 3) -> None:
+        """Espera las filas de Últimos movimientos; si el banco muestra "No pudimos cargar",
+        usa su botón Reintentar. Lanza la excepción del último intento si nunca aparecen."""
+        deadline_ms, step_ms = 30000, 2000
+        for i in range(retries + 1):
+            waited = 0
+            while waited < deadline_ms:
+                if await page.locator(self.ROW_SELECTOR).count():
+                    return
+                if await page.evaluate(JS_LAST_MOVEMENTS_ERROR):
+                    break
+                await page.wait_for_timeout(step_ms)
+                waited += step_ms
+            else:
+                raise TimeoutError("No apareció la tabla de Últimos movimientos")
+            if i == retries or not await page.evaluate(JS_CLICK_BILLED_RETRY):
+                raise RuntimeError("Últimos movimientos: 'No pudimos cargar' tras reintentar")
+            logger.info(f"Últimos movimientos falló al cargar — Reintentar ({i + 1}/{retries})")
+            await page.wait_for_timeout(4000)
 
     async def _extract_periodo(self, page: Page) -> str:
         """Extrae la fecha de próxima facturación desde la página de movimientos.
@@ -1850,16 +1894,23 @@ class FalabellaScraper:
                 has_date = bool(DATE_RE.match(str(movement.get("fecha", "") or "")))
 
                 # Detección de pendiente según estructura activa:
+                # - Sin fecha en la tabla = pendiente, en cualquier estructura (en la de
+                #   abril–mayo los pendientes sí mostraban fecha, así que ahí no aplica). Tiene
+                #   que ganar sobre el modal: en la estructura actual un pendiente cuyo modal no
+                #   trae auth code igual trae 'Cuotas' (01/01), y la rama de abajo lo guardaba
+                #   como confirmado — sin fecha, fuera del alcance de _reset_pending para siempre.
                 # - Estructura antigua (has_auth): ambos pendientes Y confirmados tienen auth
-                #   code → el único discriminador es la fecha en la tabla (sin fecha = pendiente)
+                #   code → el único discriminador es la fecha en la tabla
                 # - Estructura nueva (modal_loaded, sin auth): 'Cuotas' presente = confirmado
-                # - Fallback (modal no cargó): DATE_RE sobre fecha de tabla
-                if has_auth:
-                    movement["pendiente"] = not has_date
+                # - Fallback (modal no cargó): con fecha = confirmado
+                if not has_date:
+                    movement["pendiente"] = True
+                elif has_auth:
+                    movement["pendiente"] = False
                 elif modal_loaded:
                     movement["pendiente"] = not bool(modal_cuotas)
                 else:
-                    movement["pendiente"] = not has_date
+                    movement["pendiente"] = False
                 movement.update(detail)
                 status = "pendiente" if movement["pendiente"] else "confirmado"
                 logger.info(
