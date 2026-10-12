@@ -660,6 +660,9 @@ class FalabellaScraper:
         fecha_para_hash = fecha_compra_raw if fecha_compra_raw else f"{fecha_raw}|{periodo_fac}"
         desc_para_hash = descripcion.rstrip("*").strip().upper()
         potential_hash = _make_tx_hash(fecha_para_hash, desc_para_hash, monto_raw)
+        # El hash con que quedó la fila si en un run anterior el modal no cargó (sin
+        # fecha_compra). Coincide con potential_hash cuando hoy tampoco hay fecha_compra.
+        fallback_hash = _make_tx_hash(f"{fecha_raw}|{periodo_fac}", desc_para_hash, monto_raw)
 
         if not codigo_autorizacion:
             tx_hash = potential_hash
@@ -692,23 +695,30 @@ class FalabellaScraper:
         }
 
         cur = self.db_conn.cursor()
+        replaced_hash = None
         try:
             if codigo_autorizacion:
                 # Eliminar fila previa sin codigo_autorizacion (guardada con tx_hash) que
                 # corresponde a esta misma transacción. Ocurre cuando el modal no cargó en
                 # un run anterior y ahora sí tiene auth code: sin este DELETE quedarían
                 # dos filas para la misma transacción (duplicados).
-                if potential_hash:
-                    # Acotado al período: todas las cuotas de una compra comparten `tx_hash`,
-                    # así que sin el filtro un backfill de un mes viejo —o el pase normal al
-                    # procesar la cuota de un período con auth code recién disponible— borraría
-                    # las filas de los otros períodos de la misma compra.
-                    cur.execute(
-                        "DELETE FROM movimientos "
-                        " WHERE tx_hash = %s AND codigo_autorizacion IS NULL"
-                        "   AND periodo IS NOT DISTINCT FROM %s",
-                        (potential_hash, periodo),
-                    )
+                # Se buscan los dos hashes posibles: si el modal no cargó, la fila previa no
+                # tenía fecha_compra y se hasheó con fecha|periodo_facturacion, que no coincide
+                # con potential_hash (visto: un confirmado duplicado al día
+                # siguiente al re-procesarse como incompleta).
+                # Acotado al período: todas las cuotas de una compra comparten `tx_hash`,
+                # así que sin el filtro un backfill de un mes viejo —o el pase normal al
+                # procesar la cuota de un período con auth code recién disponible— borraría
+                # las filas de los otros períodos de la misma compra.
+                cur.execute(
+                    "DELETE FROM movimientos "
+                    " WHERE tx_hash IN (%s, %s) AND codigo_autorizacion IS NULL"
+                    "   AND periodo IS NOT DISTINCT FROM %s"
+                    " RETURNING tx_hash",
+                    (potential_hash, fallback_hash, periodo),
+                )
+                deleted = cur.fetchone()
+                replaced_hash = deleted["tx_hash"] if deleted else None
                 cur.execute(
                     """
                     INSERT INTO movimientos
@@ -787,6 +797,9 @@ class FalabellaScraper:
                 # El hash real que tenía el pendiente en DB (puede diferir de potential_hash
                 # si fecha_compra no estaba disponible cuando se scrapeó como pendiente).
                 old_hash = self.pending_hashes.pop((desc_norm, monto_norm), None)
+                # Confirmada sin auth code reemplazada arriba: su clasificación sigue al auth code.
+                if not old_hash and replaced_hash:
+                    old_hash = replaced_hash
                 # Fallback: si no está en pending_hashes, usar potential_hash (cubre el caso en
                 # que el banco sirve auth code y potential_hash coincide con el pendiente).
                 if not old_hash and codigo_autorizacion and potential_hash:

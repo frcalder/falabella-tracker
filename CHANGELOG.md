@@ -1,5 +1,44 @@
 # Changelog
 
+## 2026-10-12
+
+### Fix: un confirmado cuyo modal no cargó quedaba duplicado al completarse
+
+**Síntoma:** en Análisis y Clasificación aparece un movimiento confirmado sin fecha y sin comercio, y el mismo cargo aparece de nuevo, completo y con `codigo_autorizacion`. La fila vacía no tiene auth code, `fecha_compra`, rubro ni comercio, y se identifica por `tx_hash`.
+
+**Causa raíz:** cuando el modal de un confirmado no carga (`detalle vacío` en el log), la fila se guarda con `tx_hash` calculado sobre `fecha|periodo_facturacion`, porque no hay `fecha_compra`. En la siguiente corrida se re-procesa por estar en `incomplete_keys`. Si esta vez el modal trae auth code y `fecha_compra`, `_upsert_to_db` intenta borrar la fila previa buscando por `potential_hash`, que ahora se calcula con `fecha_compra`. Los hashes no coinciden, el DELETE no borra nada y el INSERT por `(codigo_autorizacion, num_cuotas)` crea una segunda fila. La duplicada sigue en `incomplete_keys`, así que se re-procesa en cada corrida.
+
+**Fix (`scraper/bank_scraper.py`):** el DELETE previo al upsert con auth code busca los dos hashes posibles: el de `fecha_compra` y el de respaldo `fecha|periodo_facturacion`. El hash que borra se pasa al bloque de migración, para que una clasificación hecha sobre la fila vacía siga al auth code.
+
+Los **pendientes** sin fecha y con el modal vacío no son este bug: `_reset_pending()` los borra en la próxima corrida y se vuelven a cargar.
+
+**Limpieza de DB:** busca filas sin auth code que tengan una gemela con auth code:
+
+```sql
+SELECT a.id AS id_hash, b.id AS id_auth, a.fecha, a.descripcion, a.monto, a.num_cuotas,
+       a.periodo, a.tx_hash, b.codigo_autorizacion
+  FROM movimientos a
+  JOIN movimientos b
+    ON a.codigo_autorizacion IS NULL AND a.tx_hash IS NOT NULL
+   AND b.codigo_autorizacion IS NOT NULL
+   AND a.fecha = b.fecha AND upper(a.descripcion) = upper(b.descripcion)
+   AND a.monto = b.monto
+   AND a.num_cuotas IS NOT DISTINCT FROM b.num_cuotas
+   AND a.periodo    IS NOT DISTINCT FROM b.periodo;
+```
+
+Para cada par, revisa que la fila `id_auth` tenga `fecha_compra`, rubro y comercio. Si la clasificación del `tx_hash` no existe para el auth code, mígrala. Si ya existe, bórrala. Después borra la fila vacía:
+
+```sql
+-- solo si no hay clasificación para el auth code:
+UPDATE clasificaciones SET codigo_autorizacion = '<auth>', tx_hash = NULL WHERE tx_hash = '<hash>';
+UPDATE splits          SET codigo_autorizacion = '<auth>', tx_hash = NULL WHERE tx_hash = '<hash>';
+-- en cualquier caso:
+DELETE FROM clasificaciones WHERE tx_hash = '<hash>';
+DELETE FROM splits          WHERE tx_hash = '<hash>';
+DELETE FROM movimientos     WHERE id = <id_hash>;
+```
+
 ## 2026-09-26
 
 ### Fix: un pendiente sin código de autorización se guardaba como confirmado (duplicado)
