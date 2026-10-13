@@ -63,7 +63,7 @@ Data is stored in **Supabase PostgreSQL**. The scraper runs daily via **GitHub A
 
 `incomplete_keys` holds confirmed rows missing `rubro` or `comercio`. If a movement's key is in `incomplete_keys`, it is re-processed even if already in `existing_keys`, allowing a later scraper run to fill in modal data that failed previously.
 
-**Pending movements strategy**: At the start of each run (`_reset_pending()`), all `pendiente=TRUE` rows are deleted from DB. They get re-inserted fresh during the run. This handles deduplication, monto changes, pending→confirmed transitions, and disappeared transactions.
+**Pending movements strategy**: At the start of each run (`_reset_pending()`), all `pendiente=TRUE` rows are deleted from DB. They get re-inserted fresh during the run. This handles deduplication, monto changes, pending→confirmed transitions, and disappeared transactions. Re-inserting depends on the modal loading, and it fails on a random row almost every run, so two defences keep a pendiente from losing its identity: `_open_and_read_detail` retries an empty modal once, and `_save_pending_details()` snapshots the modal fields of pendientes that had an auth code before the reset. If the modal still fails, `_restore_pending_detail()` reuses them, but only when exactly one stored pendiente has that description and monto. With two, assigning the wrong auth code would make the other one overwrite it in the `(codigo_autorizacion, num_cuotas)` upsert. Without this, the pendiente came back keyed by `tx_hash` and its classification was left orphaned.
 
 **tx_hash**:
 - Con `codigo_autorizacion`: `NULL` — auth code is the real identifier; hash is redundant

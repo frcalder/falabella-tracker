@@ -393,6 +393,7 @@ class FalabellaScraper:
         self.seen_keys: Counter = Counter()  # cuántas veces vimos cada clave en este pase
         self.incomplete_keys: set = self._load_incomplete_keys()
         self.pending_hashes: dict = {}  # {(desc_norm, monto_norm): tx_hash} — cargado antes de _reset_pending
+        self.pending_details: dict = {}  # {(desc_norm, monto_norm): [campos del modal]} — ídem
 
         # Contadores de la ejecución actual
         self.run_id: Optional[int] = None
@@ -597,6 +598,61 @@ class FalabellaScraper:
             return mapping
         except Exception:
             return {}
+
+    def _save_pending_details(self) -> dict:
+        """Guarda los campos del modal de los pendientes con auth code antes de borrarlos.
+
+        `_reset_pending()` los borra y se re-insertan con lo que traiga el modal de esta corrida.
+        Si ese modal no carga, el pendiente volvía sin auth code ni comercio: la clasificación
+        que el usuario ya le había puesto quedaba colgada de un auth code inexistente y el
+        dashboard mostraba otro movimiento sin clasificar (visto el 13/10/2026). Con esto se
+        recupera su identidad de la corrida anterior.
+        """
+        try:
+            cur = self.db_conn.cursor()
+            cur.execute(
+                "SELECT descripcion, monto, codigo_autorizacion, rubro, comercio, fecha_compra, "
+                "       hora, pais, origen "
+                "  FROM movimientos "
+                " WHERE pendiente = TRUE AND codigo_autorizacion IS NOT NULL "
+                "   AND backfill_run_id IS NULL"
+            )
+            rows = cur.fetchall()
+            cur.close()
+            mapping: dict = {}
+            for row in rows:
+                desc = str(row["descripcion"] or "").rstrip("*").strip().upper()
+                monto = str(int(abs(float(row["monto"] or 0))))
+                fc = row["fecha_compra"]
+                mapping.setdefault((desc, monto), []).append({
+                    "codigo_autorizacion": row["codigo_autorizacion"],
+                    "rubro": row["rubro"],
+                    "comercio": row["comercio"],
+                    # Mismo formato que entrega el modal, que es el que parsea _upsert_to_db.
+                    "fecha_compra": fc.strftime("%d/%m/%Y") if fc else None,
+                    "hora": row["hora"],
+                    "pais": row["pais"],
+                    "origen": row["origen"],
+                })
+            return mapping
+        except Exception:
+            return {}
+
+    def _restore_pending_detail(self, movement: Dict) -> Dict[str, str]:
+        """Campos del modal guardados para este pendiente, o {} si no hay uno inequívoco.
+
+        Solo se usa si hay exactamente un pendiente guardado con esa descripción y monto: con
+        dos, no hay cómo saber cuál es cuál y asignar mal un auth code haría que el otro
+        movimiento lo pise en el upsert por (codigo_autorizacion, num_cuotas). Se consume al
+        usarlo para que no se asigne dos veces en la misma corrida.
+        """
+        desc = str(movement.get("descripcion", "") or "").rstrip("*").strip().upper()
+        monto = str(int(abs(_parse_monto(str(movement.get("monto", "") or "")) or 0)))
+        candidatos = self.pending_details.get((desc, monto)) or []
+        if len(candidatos) != 1:
+            return {}
+        self.pending_details.pop((desc, monto))
+        return {k: v for k, v in candidatos[0].items() if v}
 
     def _reset_pending(self) -> None:
         """Elimina todos los pendientes de la DB al inicio del run para re-agregarlos frescos.
@@ -1766,7 +1822,7 @@ class FalabellaScraper:
             logger.warning(f"    Fila {index} no admite clic tras reintento — saltando")
             return False
 
-    async def _open_and_read_detail(self, page: Page, index: int) -> Dict[str, str]:
+    async def _open_and_read_detail(self, page: Page, index: int, retry: bool = True) -> Dict[str, str]:
         if not await self._click_row(page, index):
             return {}
 
@@ -1805,6 +1861,12 @@ class FalabellaScraper:
 
         if not detail:
             logger.warning(f"    Fila {index} — detalle vacío")
+            if retry:
+                # Falla en una fila al azar casi cada corrida y la siguiente apertura suele
+                # cargar. Sin el reintento el movimiento se guarda sin auth code ni comercio.
+                await self._close_modal(page)
+                logger.info(f"    Fila {index} — reintentando modal")
+                return await self._open_and_read_detail(page, index, retry=False)
         elif self.debug_mode:
             pairs = detail.pop("_debug_pairs", {})
             logger.info(f"    Fila {index} — todos los campos del modal: {pairs}")
@@ -1930,6 +1992,15 @@ class FalabellaScraper:
                     movement["pendiente"] = not bool(modal_cuotas)
                 else:
                     movement["pendiente"] = False
+                # Pendiente cuyo modal no cargó (ni al reintentar): usar lo que tenía en la
+                # corrida anterior, antes de que _reset_pending() lo borrara.
+                if not modal_loaded and movement["pendiente"]:
+                    detail = self._restore_pending_detail(movement)
+                    if detail:
+                        logger.info(
+                            f"    Modal recuperado de la corrida anterior "
+                            f"(auth {detail['codigo_autorizacion']})"
+                        )
                 movement.update(detail)
                 status = "pendiente" if movement["pendiente"] else "confirmado"
                 logger.info(
@@ -2017,6 +2088,7 @@ class FalabellaScraper:
                     self._finish_run("error", "Navegación a movimientos fallida")
                     return []
                 self.pending_hashes = self._save_pending_hashes()
+                self.pending_details = self._save_pending_details()
                 self._reset_pending()
                 movements = await self.extract_all_movements(page)
                 # El backfill va al final: si falla, la corrida del día ya está guardada.
