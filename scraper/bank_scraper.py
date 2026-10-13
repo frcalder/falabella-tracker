@@ -1854,6 +1854,18 @@ class FalabellaScraper:
         except Exception:
             pass  # si no aparece, intentamos extraer igual
 
+        # 'Comercio' aparece antes que los pares de etiquetas con que JS_EXTRACT_FIELDS ubica
+        # el modal, así que la espera de arriba no basta: en CI se extraía con el modal a medio
+        # renderizar y salía vacío, también al reintentar. En local con --debug no pasaba porque
+        # el screenshot de abajo da tiempo (visto el 13/10/2026).
+        try:
+            await page.wait_for_function(
+                f"() => Object.keys(({JS_EXTRACT_FIELDS.strip()})()).length > 0",
+                timeout=5000,
+            )
+        except Exception:
+            pass
+
         if self.debug_mode:
             await self._screenshot(page, f"detail_open_{index:03d}")
 

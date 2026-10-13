@@ -12,6 +12,7 @@ La entrada del 12/10 decía que los pendientes con el modal vacío no eran ese b
 
 **Fix (`scraper/bank_scraper.py`):**
 - `_open_and_read_detail` reintenta una vez cuando el modal sale vacío.
+- Además, antes de extraer, `_open_and_read_detail` espera a que `JS_EXTRACT_FIELDS` ubique el modal. La espera previa terminaba apenas aparecía la etiqueta `Comercio`, que se renderiza antes que los pares de etiquetas que la extracción usa como ancla, así que en CI se extraía a medio renderizar y el modal salía vacío una y otra vez.
 - `_save_pending_details()` guarda antes del reset los campos del modal de los pendientes con auth code: auth, rubro, comercio, fecha_compra, hora, país y origen. Si el modal falla también en el reintento, `_restore_pending_detail()` los recupera. Solo lo hace si hay exactamente un pendiente guardado con esa descripción y monto: con dos no se sabe cuál es cuál, y asignar mal el auth code haría que uno pise al otro.
 
 **Limpieza de DB:** no hace falta. La clasificación huérfana se vuelve a enganchar sola cuando el modal entregue de nuevo el auth code. Para encontrar clasificaciones huérfanas:
